@@ -24,18 +24,20 @@ import (
 	"github.com/McHauge/Spout-Multi-Recorder/internal/assets"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/audio"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/engine"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
 )
 
 // Config is persisted between runs.
 type Config struct {
-	AudioDevice   string `json:"audio_device"`
-	AudioLoopback bool   `json:"audio_loopback"`
-	Codec         string `json:"codec"`
-	FPS           int    `json:"fps"`
-	OutDir        string `json:"out_dir"`
-	MaxChannels   int    `json:"max_channels"`
-	AutoRecord    bool   `json:"auto_record"`
+	AudioDevice   string   `json:"audio_device"`
+	AudioLoopback bool     `json:"audio_loopback"`
+	Codec         string   `json:"codec"`
+	FPS           int      `json:"fps"`
+	OutDir        string   `json:"out_dir"`
+	MaxChannels   int      `json:"max_channels"`
+	AutoRecord    bool     `json:"auto_record"`
+	NDISources    []string `json:"ndi_sources"`
 }
 
 func configPath() string {
@@ -125,6 +127,9 @@ func Run(eng *engine.Engine, aud *audio.Engine) {
 	a.fapp.SetIcon(assets.Icon)
 	eng.SetMaxChannels(a.cfg.MaxChannels)
 	eng.SetAutoRecord(a.cfg.AutoRecord)
+	for _, n := range a.cfg.NDISources {
+		eng.AddNDI(n)
+	}
 	a.ffmpegPath, a.ffmpegErr = recorder.FindFFmpeg()
 	if a.ffmpegErr == nil {
 		recorder.ProbeEncoders(a.ffmpegPath)
@@ -239,11 +244,14 @@ func (a *App) buildUI() {
 		layout.NewSpacer(),
 		widget.NewLabel("Audio:"), a.audioSel,
 	)
+	addNDIBtn := widget.NewButtonWithIcon("Add NDI", theme.ContentAddIcon(), a.addNDISource)
 	row2 := container.NewHBox(
 		widget.NewLabel("Codec:"), a.codecSel,
 		widget.NewLabel("FPS:"), a.fpsSel,
 		widget.NewLabel("Max channels:"), a.maxChSel,
 		a.autoChk,
+		layout.NewSpacer(),
+		addNDIBtn,
 	)
 	row3 := container.NewBorder(nil, nil, widget.NewLabel("Save to:"), a.browseBtn, a.outEntry)
 
@@ -340,11 +348,106 @@ func (a *App) newCard(ch *engine.Channel) *channelCard {
 	}
 	status := widget.NewLabel("⚫ waiting")
 
-	name := widget.NewLabelWithStyle(ch.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	title := ch.DisplayName()
+	if ch.NDI {
+		title = "NDI • " + title
+	}
+	name := widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	name.Truncation = fyne.TextTruncateEllipsis
 
-	box := container.NewVBox(name, img, container.NewHBox(check, layout.NewSpacer(), status))
+	var header fyne.CanvasObject = name
+	if ch.NDI {
+		rm := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() { a.removeNDISource(ch) })
+		header = container.NewBorder(nil, nil, nil, rm, name)
+	}
+
+	box := container.NewVBox(header, img, container.NewHBox(check, layout.NewSpacer(), status))
 	return &channelCard{ch: ch, img: img, check: check, status: status, obj: container.NewPadded(box)}
+}
+
+// addNDISource browses the network and lets the user pick a source to add.
+func (a *App) addNDISource() {
+	if err := ndi.Available(); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	searching := dialog.NewCustomWithoutButtons("Searching for NDI sources…",
+		widget.NewProgressBarInfinite(), a.win)
+	searching.Show()
+
+	go func() {
+		srcs, err := ndi.FindSources(3 * time.Second)
+		fyne.Do(func() {
+			searching.Hide()
+			if err != nil {
+				dialog.ShowError(err, a.win)
+				return
+			}
+			// Filter out sources that are already added.
+			existing := map[string]bool{}
+			for _, ch := range a.eng.Channels() {
+				if ch.NDI {
+					existing[ch.DisplayName()] = true
+				}
+			}
+			var names []string
+			for _, s := range srcs {
+				if !existing[s.Name] {
+					names = append(names, s.Name)
+				}
+			}
+			if len(names) == 0 {
+				dialog.ShowInformation("Add NDI source",
+					"No (new) NDI sources found on the network.\nBoth full NDI and NDI|HX sources are supported.", a.win)
+				return
+			}
+
+			selected := -1
+			list := widget.NewList(
+				func() int { return len(names) },
+				func() fyne.CanvasObject { return widget.NewLabel("source name placeholder") },
+				func(i widget.ListItemID, o fyne.CanvasObject) { o.(*widget.Label).SetText(names[i]) },
+			)
+			list.OnSelected = func(id widget.ListItemID) { selected = id }
+			d := dialog.NewCustomConfirm("Add NDI source", "Add", "Cancel",
+				container.NewVScroll(list), func(ok bool) {
+					if !ok || selected < 0 {
+						return
+					}
+					name := names[selected]
+					a.eng.AddNDI(name)
+					found := false
+					for _, n := range a.cfg.NDISources {
+						if n == name {
+							found = true
+						}
+					}
+					if !found {
+						a.cfg.NDISources = append(a.cfg.NDISources, name)
+						a.cfg.save()
+					}
+				}, a.win)
+			d.Resize(fyne.NewSize(520, 400))
+			d.Show()
+		})
+	}()
+}
+
+// removeNDISource removes an NDI channel and forgets it in the config.
+func (a *App) removeNDISource(ch *engine.Channel) {
+	if err := a.eng.RemoveChannel(ch.Name); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	name := ch.DisplayName()
+	out := a.cfg.NDISources[:0]
+	for _, n := range a.cfg.NDISources {
+		if n != name {
+			out = append(out, n)
+		}
+	}
+	a.cfg.NDISources = out
+	a.cfg.save()
 }
 
 func (a *App) startTickers() {

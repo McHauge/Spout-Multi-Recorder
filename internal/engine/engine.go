@@ -6,18 +6,24 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/McHauge/Spout-Multi-Recorder/internal/frame"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/spout"
 )
 
+// NDIPrefix namespaces manually added NDI channels in the channel map.
+const NDIPrefix = "ndi:"
+
 // Channel is one Spout sender being monitored (and possibly recorded).
 type Channel struct {
-	Name string
+	Name string // Spout sender name, or "ndi:<source name>" for NDI
+	NDI  bool
 	Buf  *frame.Buffer
 
 	armed    atomic.Bool
@@ -41,11 +47,96 @@ func (c *Channel) SetArmed(v bool) { c.armed.Store(v) }
 // Online reports whether the sender currently exists.
 func (c *Channel) Online() bool { return c.online.Load() }
 
+// DisplayName is the channel name without the NDI namespace prefix.
+func (c *Channel) DisplayName() string { return strings.TrimPrefix(c.Name, NDIPrefix) }
+
 // Recorder returns the active recorder, or nil.
 func (c *Channel) Recorder() *recorder.Recorder {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.rec
+}
+
+// sleepStop sleeps for d or until the channel is stopped (returns false).
+func (c *Channel) sleepStop(d time.Duration) bool {
+	select {
+	case <-c.stop:
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// captureNDI receives frames from a manually added NDI source. Both full
+// NDI and NDI|HX sources work — the runtime decodes HX transparently.
+func (c *Channel) captureNDI() {
+	defer close(c.done)
+	if err := ndi.Available(); err != nil {
+		log.Printf("channel %s: %v", c.Name, err)
+		<-c.stop
+		return
+	}
+	name := c.DisplayName()
+	var rx *ndi.Receiver
+	defer func() {
+		if rx != nil {
+			rx.Close()
+		}
+	}()
+	var lastFrame time.Time
+	for {
+		select {
+		case <-c.stop:
+			return
+		default:
+		}
+		if rx == nil {
+			// Resolve the source on the network, then connect once; the NDI
+			// receiver reconnects automatically if the source drops later.
+			srcs, err := ndi.FindSources(2 * time.Second)
+			if err != nil {
+				log.Printf("channel %s: %v", c.Name, err)
+				if !c.sleepStop(5 * time.Second) {
+					return
+				}
+				continue
+			}
+			var found *ndi.Source
+			for i := range srcs {
+				if srcs[i].Name == name {
+					found = &srcs[i]
+					break
+				}
+			}
+			if found == nil {
+				c.online.Store(false)
+				c.Buf.SetConnected(false)
+				if !c.sleepStop(2 * time.Second) {
+					return
+				}
+				continue
+			}
+			r, err := ndi.NewReceiver(*found)
+			if err != nil {
+				log.Printf("channel %s: %v", c.Name, err)
+				if !c.sleepStop(5 * time.Second) {
+					return
+				}
+				continue
+			}
+			rx = r
+			log.Printf("NDI connected: %q", name)
+		}
+		pix, w, h, ok := rx.Capture(250 * time.Millisecond)
+		if ok {
+			c.online.Store(true)
+			c.Buf.Store(pix, w, h, spout.FormatBGRA8, true)
+			lastFrame = time.Now()
+		} else if rx.Connections() == 0 || time.Since(lastFrame) > 3*time.Second {
+			c.online.Store(false)
+			c.Buf.SetConnected(false)
+		}
+	}
 }
 
 // captureLoop polls the Spout receiver and publishes frames to the mailbox.
@@ -181,9 +272,10 @@ func (e *Engine) discoveryLoop() {
 
 		// Remove channels whose sender has been gone for a while, but never
 		// while recording (they keep producing black frames instead).
+		// NDI channels are manual and only removed by the user.
 		if !e.recording {
 			for name, c := range e.channels {
-				if seen[name] {
+				if seen[name] || c.NDI {
 					continue
 				}
 				if now-c.lastSeen.Load() > int64(5*time.Second) {
@@ -238,6 +330,66 @@ func (e *Engine) discoveryLoop() {
 			e.OnChange()
 		}
 	}
+}
+
+// AddNDI adds a manually selected NDI source as a channel (idempotent).
+func (e *Engine) AddNDI(sourceName string) {
+	key := NDIPrefix + sourceName
+	e.mu.Lock()
+	if _, ok := e.channels[key]; ok {
+		e.mu.Unlock()
+		return
+	}
+	c := &Channel{
+		Name: key,
+		NDI:  true,
+		Buf:  &frame.Buffer{},
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	c.lastSeen.Store(time.Now().UnixNano())
+	c.SetArmed(true)
+	e.channels[key] = c
+	e.order = append(e.order, key)
+	sort.Strings(e.order)
+	go c.captureNDI()
+	e.mu.Unlock()
+	log.Printf("added NDI source %q", sourceName)
+	if e.OnChange != nil {
+		e.OnChange()
+	}
+}
+
+// RemoveChannel removes a (manually added) channel. It refuses while the
+// channel is being recorded.
+func (e *Engine) RemoveChannel(name string) error {
+	e.mu.Lock()
+	c, ok := e.channels[name]
+	if !ok {
+		e.mu.Unlock()
+		return nil
+	}
+	c.mu.Lock()
+	recording := c.rec != nil
+	c.mu.Unlock()
+	if recording {
+		e.mu.Unlock()
+		return fmt.Errorf("%s is recording — stop the recording first", c.DisplayName())
+	}
+	close(c.stop)
+	delete(e.channels, name)
+	for i, o := range e.order {
+		if o == name {
+			e.order = append(e.order[:i], e.order[i+1:]...)
+			break
+		}
+	}
+	e.mu.Unlock()
+	log.Printf("removed channel %q", name)
+	if e.OnChange != nil {
+		e.OnChange()
+	}
+	return nil
 }
 
 // Channels returns the channels in stable (alphabetical) order.
