@@ -1,0 +1,60 @@
+# GoReleaser configuration for Spout Multi Recorder.
+#
+# The app is Windows-only (Spout/DirectX + WASAPI) and uses cgo, so releases
+# are cross-compiled from Linux with the llvm-mingw toolchain — see
+# .github/workflows/release.yml, which installs it and adds it to PATH.
+#
+# Local snapshot build (on Linux/WSL with llvm-mingw installed):
+#   goreleaser release --snapshot --clean
+version: 2
+
+project_name: SpoutMultiRecorder
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: windows
+    main: .
+    binary: SpoutMultiRecorder
+    goos:
+      - windows
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=1
+      - CC=x86_64-w64-mingw32-gcc
+      - CXX=x86_64-w64-mingw32-g++
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -H windowsgui
+      - -extldflags "-static"
+
+archives:
+  - id: windows-zip
+    formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_windows_amd64"
+    files:
+      - README.md
+      - LICENSE
+      - src: internal/spout/SPOUT_LICENSE.txt
+        dst: SPOUT_LICENSE.txt
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  footer: |
+    ### Running it
+    Windows 10/11 x64. Put `ffmpeg.exe` next to `SpoutMultiRecorder.exe`
+    or anywhere on `PATH` (e.g. `winget install ffmpeg`), then start the app.

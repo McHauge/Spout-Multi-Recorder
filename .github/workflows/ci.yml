@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  LLVM_MINGW: llvm-mingw-20250528-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Install llvm-mingw cross toolchain
+        run: |
+          curl -sL --retry 3 -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20250528/${LLVM_MINGW}.tar.xz"
+          sudo tar -C /opt -xJf /tmp/llvm-mingw.tar.xz
+          echo "/opt/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
+          LIB="/opt/${LLVM_MINGW}/x86_64-w64-mingw32/lib"
+          sudo cp "$LIB/libc++.a" "$LIB/libstdc++.a"
+
+      - name: Test (host)
+        run: go test ./internal/frame/
+
+      - name: Cross-build windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+        run: go build -ldflags "-H windowsgui -s -w -extldflags '-static'" -o /tmp/SpoutMultiRecorder.exe .
+
+      - name: Vet
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+        run: go vet ./...

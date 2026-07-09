@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  LLVM_MINGW: llvm-mingw-20250528-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Install llvm-mingw cross toolchain
+        run: |
+          curl -sL --retry 3 -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20250528/${LLVM_MINGW}.tar.xz"
+          sudo tar -C /opt -xJf /tmp/llvm-mingw.tar.xz
+          echo "/opt/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
+          # cgo links with -lstdc++ (for GCC toolchains); llvm-mingw ships
+          # libc++ instead, so provide libstdc++ as an alias.
+          LIB="/opt/${LLVM_MINGW}/x86_64-w64-mingw32/lib"
+          sudo cp "$LIB/libc++.a" "$LIB/libstdc++.a"
+
+      - name: Run tests
+        run: go test ./internal/frame/
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
