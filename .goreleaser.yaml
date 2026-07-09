@@ -22,6 +22,13 @@ builds:
       - windows
     goarch:
       - amd64
+    hooks:
+      # Regenerate the Windows resources (exe icon + version info) so the
+      # version properties match the release tag. Requires go-winres on PATH
+      # (the release workflow installs it). The committed rsrc_windows_amd64.syso
+      # is a fallback for plain local `go build`.
+      pre:
+        - cmd: go-winres simply --icon internal/assets/icon.png --arch amd64 --product-name "Spout Multi Recorder" --file-description "Spout Multi Recorder" --product-version {{ .Version }} --file-version {{ .Major }}.{{ .Minor }}.{{ .Patch }}.0
     env:
       - CGO_ENABLED=1
       - CC=x86_64-w64-mingw32-gcc

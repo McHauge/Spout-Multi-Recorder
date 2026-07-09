@@ -21,7 +21,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
           cache: true
 
       - name: Install llvm-mingw cross toolchain
@@ -34,6 +34,11 @@ jobs:
           # libc++ instead, so provide libstdc++ as an alias.
           LIB="/opt/${LLVM_MINGW}/x86_64-w64-mingw32/lib"
           sudo cp "$LIB/libc++.a" "$LIB/libstdc++.a"
+
+      - name: Install go-winres (exe icon + version resources)
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run tests
         run: go test ./internal/frame/

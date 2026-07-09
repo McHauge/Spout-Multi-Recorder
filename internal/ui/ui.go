@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/McHauge/Spout-Multi-Recorder/internal/assets"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/audio"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/engine"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
@@ -121,6 +122,7 @@ func Run(eng *engine.Engine, aud *audio.Engine) {
 		cfg:   LoadConfig(),
 		cards: map[string]*channelCard{},
 	}
+	a.fapp.SetIcon(assets.Icon)
 	eng.SetMaxChannels(a.cfg.MaxChannels)
 	eng.SetAutoRecord(a.cfg.AutoRecord)
 	a.ffmpegPath, a.ffmpegErr = recorder.FindFFmpeg()
