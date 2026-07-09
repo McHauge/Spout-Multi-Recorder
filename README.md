@@ -4,6 +4,8 @@ Records **all [Spout](https://spout.zeal.co/) video streams** on a PC to disk si
 
 Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutDX, vendored under `internal/spout/`) via cgo, WASAPI audio capture via [malgo](https://github.com/gen2brain/malgo), FFmpeg for encoding, and a [Fyne](https://fyne.io) desktop UI.
 
+![Spout Multi Recorder](docs/screenshot.png)
+
 ## Features
 
 - Auto-discovers every Spout sender on the machine; each gets a live preview card.
