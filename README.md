@@ -62,16 +62,16 @@ SpoutRecordings/
 └── 2026-07-10_13-45-14/
     ├── OBS_Studio_2026-07-10_13-45-14.mp4
     ├── Resolume_2026-07-10_13-45-14.mp4
-    ├── 2026-07-10_13-45-14.drp
-    ├── 2026-07-10_13-45-14.xml
-    └── 2026-07-10_13-45-14.fcpxml
+    ├── 2026-07-10_13-45-14_ATEM_Project.drp
+    ├── 2026-07-10_13-45-14_MultiCam_Timeline.xml
+    └── 2026-07-10_13-45-14_MultiCam_Clip.fcpxml
 ```
 
 Ways in, most to least reliable:
 
-1. **`.xml`** (FCP7 timeline) — *File → Import → Timeline*. A timeline with **every stream on its own video/audio track**, aligned by timecode and visible side by side. This is Resolve's most dependable interchange import. For a true multicam clip, select the imported clips in the media pool, right-click → *New Multicam Clip Using Selected Clips* → Angle Sync: **Timecode**.
-2. **`.drp`** — the same project format the Blackmagic ATEM Mini ISO writes. Double-click it (or *Project Manager → Import Project*) and Resolve creates a project with every stream in the media pool (timecode-aligned) and a program timeline. Note: like an ATEM project with no live switching, the timeline shows just the first stream — the value is the ready-made project + media pool. Keep the `.drp` next to the media files, it references them by name.
-3. **`.fcpxml`** — *File → Import → Timeline*. Contains a real **multicam clip** with one angle per stream. Resolve's FCPXML multicam import is historically hit-and-miss; if it comes in flattened, use the `.xml` or timecode sync instead.
+1. **`_MultiCam_Timeline.xml`** (FCP7 timeline) — *File → Import → Timeline*. A timeline with **every stream on its own video/audio track**, aligned by timecode and visible side by side. This is Resolve's most dependable interchange import. For a true multicam clip, select the imported clips in the media pool, right-click → *New Multicam Clip Using Selected Clips* → Angle Sync: **Timecode**.
+2. **`_ATEM_Project.drp`** — the same project format the Blackmagic ATEM Mini ISO writes. Double-click it (or *Project Manager → Import Project*) and Resolve creates a project with every stream in the media pool (timecode-aligned) and a program timeline. Note: like an ATEM project with no live switching, the timeline shows just the first stream — the value is the ready-made project + media pool. Keep the `.drp` next to the media files, it references them by name.
+3. **`_MultiCam_Clip.fcpxml`** — *File → Import → Timeline*. Contains a real **multicam clip** with one angle per stream. Resolve's FCPXML multicam import is historically hit-and-miss; if it comes in flattened, use the `.xml` or timecode sync instead.
 4. **Timecode sync** — always works regardless of project files: drop the media files in the media pool, select them, right-click → *New Multicam Clip Using Selected Clips* → sync by **Timecode**.
 
 Notes: the start timecode is the wall-clock time of day, so files also sync against other timecode-jammed sources recorded on the same machine. The MKV (Opus) presets store timecode as a tag rather than a `tmcd` track and MKV support in Resolve is limited — prefer MP4 or MOV presets for editing workflows.

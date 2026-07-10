@@ -240,7 +240,9 @@ func (e *Engine) SetAutoRecord(v bool) {
 	e.mu.Unlock()
 }
 
-// Close stops discovery, capture loops and any recording.
+// Close stops discovery, capture loops and any recording. The wait for the
+// capture goroutines is bounded: an NDI receiver teardown can block inside
+// the runtime (NDIlib_recv_destroy), and shutdown must not hang on it.
 func (e *Engine) Close() {
 	close(e.stop)
 	e.StopRecording()
@@ -250,9 +252,21 @@ func (e *Engine) Close() {
 		chans = append(chans, c)
 	}
 	e.mu.Unlock()
+	// Signal all channels first so they shut down in parallel.
 	for _, c := range chans {
 		close(c.stop)
-		<-c.done
+	}
+	done := make(chan struct{})
+	go func() {
+		for _, c := range chans {
+			<-c.done
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("shutdown: capture loops still busy after 5s (NDI runtime teardown?), not waiting")
 	}
 }
 

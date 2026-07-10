@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/sys/windows"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
@@ -166,10 +168,26 @@ func Run(eng *engine.Engine, aud *audio.Engine, version string) {
 
 	a.win.SetOnClosed(func() {
 		a.cfg.save()
-		eng.Close()
-		aud.Close()
 	})
 	a.win.ShowAndRun()
+
+	// The window is gone — tear down with a hard deadline. Both the NDI and
+	// WASAPI runtimes can hang during teardown, and even ExitProcess (what
+	// os.Exit calls) runs DLL detach handlers that can block forever. The
+	// watchdog therefore uses TerminateProcess, which skips DLL teardown and
+	// cannot be blocked. 30 s leaves room for an active recording session to
+	// finalise its files (recorder.Stop waits up to 15 s per FFmpeg process).
+	log.Printf("shutting down")
+	go func() {
+		time.Sleep(30 * time.Second)
+		log.Printf("shutdown watchdog: teardown stuck after 30s, terminating process")
+		_ = windows.TerminateProcess(windows.CurrentProcess(), 0)
+	}()
+	eng.Close() // bounded: waits at most ~5 s for capture loops
+	log.Printf("engine closed")
+	aud.Close()
+	log.Printf("audio closed, exiting")
+	os.Exit(0)
 }
 
 func (a *App) buildUI() {

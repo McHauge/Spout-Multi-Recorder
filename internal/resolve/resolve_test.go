@@ -157,7 +157,7 @@ func TestWriteProject(t *testing.T) {
 	if err := WriteProject(dir, "2026-07-10_13-45-14", 30, testClips()); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"2026-07-10_13-45-14.drp", "2026-07-10_13-45-14.xml", "2026-07-10_13-45-14.fcpxml"} {
+	for _, f := range []string{"2026-07-10_13-45-14_ATEM_Project.drp", "2026-07-10_13-45-14_MultiCam_Timeline.xml", "2026-07-10_13-45-14_MultiCam_Clip.fcpxml"} {
 		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
 			t.Errorf("missing %s: %v", f, err)
 		}
