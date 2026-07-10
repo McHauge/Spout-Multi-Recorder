@@ -9,6 +9,9 @@ Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutD
 ## Features
 
 - Records any number of channels at once, each at its native resolution, to `<sender>_<timestamp>.<ext>`. Live preview cards with per-channel VU meters.
+- **Folder per recording** (optional, on by default): each session goes into its own timestamped subfolder of the output directory, so all the streams that were recorded together stay together.
+- **Embedded timecode** (optional, on by default): each file's start timecode is the wall-clock time of day (a `tmcd` track in MP4/MOV, a `TIMECODE` tag in MKV), so all files from one session — including channels that joined mid-session via auto-record — line up frame-accurately in any NLE that syncs by timecode.
+- **DaVinci Resolve project export** (optional, on by default): stopping a session writes `.drp`, `.xml` and `.fcpxml` project files next to the recordings — see [DaVinci Resolve workflow](#davinci-resolve-workflow).
 - Robust to sources dropping out: recording continues with **black frames** (and silence) at constant framerate, and picks the stream back up when the source returns — even at a new resolution (frames are centered/cropped).
 - **Auto-record**: while a session is running, new Spout senders are automatically armed and get their own file. You can even hit Record with zero senders and let them join as they start up.
 - Settings persist between runs (`%APPDATA%\SpoutMultiRecorder\config.json`, log next to it).
@@ -49,6 +52,29 @@ Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutD
 4. Tick **record** on the channels you want, press **Record**, later **Stop**. Every armed channel becomes its own file.
 
 Good test senders: the *Spout Demo Sender* from the Spout distribution, OBS (Spout2 plugin or NDI output), Resolume, TouchDesigner.
+
+## DaVinci Resolve workflow
+
+With **Folder per recording**, **Embed timecode** and **Resolve project** enabled (all default), every session folder is a self-contained multicam package:
+
+```
+SpoutRecordings/
+└── 2026-07-10_13-45-14/
+    ├── OBS_Studio_2026-07-10_13-45-14.mp4
+    ├── Resolume_2026-07-10_13-45-14.mp4
+    ├── 2026-07-10_13-45-14.drp
+    ├── 2026-07-10_13-45-14.xml
+    └── 2026-07-10_13-45-14.fcpxml
+```
+
+Ways in, most to least reliable:
+
+1. **`.xml`** (FCP7 timeline) — *File → Import → Timeline*. A timeline with **every stream on its own video/audio track**, aligned by timecode and visible side by side. This is Resolve's most dependable interchange import. For a true multicam clip, select the imported clips in the media pool, right-click → *New Multicam Clip Using Selected Clips* → Angle Sync: **Timecode**.
+2. **`.drp`** — the same project format the Blackmagic ATEM Mini ISO writes. Double-click it (or *Project Manager → Import Project*) and Resolve creates a project with every stream in the media pool (timecode-aligned) and a program timeline. Note: like an ATEM project with no live switching, the timeline shows just the first stream — the value is the ready-made project + media pool. Keep the `.drp` next to the media files, it references them by name.
+3. **`.fcpxml`** — *File → Import → Timeline*. Contains a real **multicam clip** with one angle per stream. Resolve's FCPXML multicam import is historically hit-and-miss; if it comes in flattened, use the `.xml` or timecode sync instead.
+4. **Timecode sync** — always works regardless of project files: drop the media files in the media pool, select them, right-click → *New Multicam Clip Using Selected Clips* → sync by **Timecode**.
+
+Notes: the start timecode is the wall-clock time of day, so files also sync against other timecode-jammed sources recorded on the same machine. The MKV (Opus) presets store timecode as a tag rather than a `tmcd` track and MKV support in Resolve is limited — prefer MP4 or MOV presets for editing workflows.
 
 ## Building
 

@@ -5,6 +5,8 @@ package engine
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 	"github.com/McHauge/Spout-Multi-Recorder/internal/frame"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/resolve"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/spout"
 )
 
@@ -202,6 +205,8 @@ type Engine struct {
 	maxChannels int
 	autoRecord  bool
 	recSet      recorder.Settings
+	sessionDir  string // where the current/last session's files go
+	sessionName string // timestamp name of the current/last session
 	stop        chan struct{}
 
 	// OnChange is called (from the discovery goroutine) whenever the channel
@@ -447,6 +452,16 @@ func (e *Engine) StartRecording(set recorder.Settings) (int, error) {
 	if e.recording {
 		return 0, fmt.Errorf("already recording")
 	}
+	e.sessionName = time.Now().Format("2006-01-02_15-04-05")
+	e.sessionDir = set.OutDir
+	if set.SessionFolders {
+		dir := filepath.Join(set.OutDir, e.sessionName)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return 0, fmt.Errorf("create session folder: %w", err)
+		}
+		set.OutDir = dir
+		e.sessionDir = dir
+	}
 	e.recSet = set
 	started := 0
 	var firstErr error
@@ -505,29 +520,73 @@ func (e *Engine) audioSourceFor(c *Channel, set recorder.Settings) recorder.Audi
 	return nil
 }
 
-// StopRecording stops all recorders (in parallel) and waits for the files to
-// be finalised.
+// StopRecording stops all recorders (in parallel), waits for the files to be
+// finalised and, if enabled, writes the DaVinci Resolve project files for the
+// session next to the recordings.
 func (e *Engine) StopRecording() {
 	e.mu.Lock()
 	if !e.recording {
 		e.mu.Unlock()
 		return
 	}
-	var wg sync.WaitGroup
+	set := e.recSet
+	sessionDir, sessionName := e.sessionDir, e.sessionName
+	var recs []*recorder.Recorder
 	for _, c := range e.channels {
 		c.mu.Lock()
 		rec := c.rec
 		c.rec = nil
 		c.mu.Unlock()
 		if rec != nil {
-			wg.Add(1)
-			go func(r *recorder.Recorder) {
-				defer wg.Done()
-				r.Stop()
-			}(rec)
+			recs = append(recs, rec)
 		}
 	}
 	e.recording = false
 	e.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, rec := range recs {
+		wg.Add(1)
+		go func(r *recorder.Recorder) {
+			defer wg.Done()
+			r.Stop()
+		}(rec)
+	}
 	wg.Wait()
+
+	if !set.ResolveProject || len(recs) == 0 {
+		return
+	}
+	clips := make([]resolve.Clip, 0, len(recs))
+	for _, rec := range recs {
+		info := rec.Info()
+		if info.Frames == 0 {
+			continue // nothing usable was written
+		}
+		clips = append(clips, resolve.Clip{
+			Name:        strings.TrimPrefix(info.Name, NDIPrefix),
+			Path:        info.File,
+			W:           info.W,
+			H:           info.H,
+			StartFrames: info.StartFrames,
+			DurFrames:   info.Frames,
+			AudioCh:     info.AudioCh,
+		})
+	}
+	if len(clips) == 0 {
+		return
+	}
+	if err := resolve.WriteProject(sessionDir, sessionName, set.FPS, clips); err != nil {
+		log.Printf("resolve project export: %v", err)
+	} else {
+		log.Printf("wrote Resolve project files %s.drp/.xml/.fcpxml (%d clips)", sessionName, len(clips))
+	}
+}
+
+// SessionDir returns the folder the current (or most recent) recording
+// session writes to.
+func (e *Engine) SessionDir() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sessionDir
 }

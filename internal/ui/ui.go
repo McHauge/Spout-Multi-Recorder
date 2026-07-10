@@ -30,14 +30,23 @@ import (
 
 // Config is persisted between runs.
 type Config struct {
-	AudioDevice   string   `json:"audio_device"`
-	AudioLoopback bool     `json:"audio_loopback"`
-	Codec         string   `json:"codec"`
-	FPS           int      `json:"fps"`
-	OutDir        string   `json:"out_dir"`
-	MaxChannels   int      `json:"max_channels"`
-	AutoRecord    bool     `json:"auto_record"`
-	NDISources    []string `json:"ndi_sources"`
+	AudioDevice   string `json:"audio_device"`
+	AudioLoopback bool   `json:"audio_loopback"`
+	Codec         string `json:"codec"`
+	FPS           int    `json:"fps"`
+	OutDir        string `json:"out_dir"`
+	MaxChannels   int    `json:"max_channels"`
+	AutoRecord    bool   `json:"auto_record"`
+	// SessionFolders puts each recording session into its own timestamped
+	// subfolder of OutDir so files that belong together stay together.
+	SessionFolders bool `json:"session_folders"`
+	// Timecode embeds the wall-clock time-of-day as each file's start
+	// timecode, for timecode sync in DaVinci Resolve etc.
+	Timecode bool `json:"timecode"`
+	// ResolveProject writes .drp, .xml and .fcpxml project files next to
+	// the recordings for direct import into DaVinci Resolve.
+	ResolveProject bool     `json:"resolve_project"`
+	NDISources     []string `json:"ndi_sources"`
 	// Per-NDI-source master-audio preference (default false = native NDI audio).
 	NDIReplaceAudio map[string]bool `json:"ndi_replace_audio,omitempty"`
 }
@@ -54,7 +63,8 @@ func configPath() string {
 
 // LoadConfig reads the saved configuration (with defaults).
 func LoadConfig() Config {
-	cfg := Config{Codec: "h264", FPS: 30, MaxChannels: 8}
+	cfg := Config{Codec: "h264", FPS: 30, MaxChannels: 8,
+		SessionFolders: true, Timecode: true, ResolveProject: true}
 	home, _ := os.UserHomeDir()
 	cfg.OutDir = filepath.Join(home, "Videos", "SpoutRecordings")
 	if b, err := os.ReadFile(configPath()); err == nil {
@@ -94,13 +104,16 @@ type App struct {
 	scroll    *container.Scroll
 	emptyBox  fyne.CanvasObject
 
-	audioSel  *widget.Select
-	codecSel  *widget.Select
-	fpsSel    *widget.Select
-	maxChSel  *widget.Select
-	autoChk   *widget.Check
-	outEntry  *widget.Entry
-	browseBtn *widget.Button
+	audioSel   *widget.Select
+	codecSel   *widget.Select
+	fpsSel     *widget.Select
+	maxChSel   *widget.Select
+	autoChk    *widget.Check
+	sessionChk *widget.Check
+	tcChk      *widget.Check
+	resolveChk *widget.Check
+	outEntry   *widget.Entry
+	browseBtn  *widget.Button
 
 	devices  []audio.Device
 	cards    map[string]*channelCard
@@ -221,6 +234,23 @@ func (a *App) buildUI() {
 	})
 	a.autoChk.SetChecked(a.cfg.AutoRecord)
 
+	// --- session / Resolve options
+	a.sessionChk = widget.NewCheck("Folder per recording", func(v bool) {
+		a.cfg.SessionFolders = v
+		a.cfg.save()
+	})
+	a.sessionChk.SetChecked(a.cfg.SessionFolders)
+	a.tcChk = widget.NewCheck("Embed timecode", func(v bool) {
+		a.cfg.Timecode = v
+		a.cfg.save()
+	})
+	a.tcChk.SetChecked(a.cfg.Timecode)
+	a.resolveChk = widget.NewCheck("Resolve project files (.drp/.xml/.fcpxml)", func(v bool) {
+		a.cfg.ResolveProject = v
+		a.cfg.save()
+	})
+	a.resolveChk.SetChecked(a.cfg.ResolveProject)
+
 	// --- output folder
 	a.outEntry = widget.NewEntry()
 	a.outEntry.SetText(a.cfg.OutDir)
@@ -262,6 +292,7 @@ func (a *App) buildUI() {
 		addNDIBtn,
 	)
 	row3 := container.NewBorder(nil, nil, widget.NewLabel("Save to:"), a.browseBtn, a.outEntry)
+	row4 := container.NewHBox(a.sessionChk, a.tcChk, a.resolveChk, layout.NewSpacer())
 
 	a.grid = container.NewGridWrap(fyne.NewSize(324, 300))
 	a.scroll = container.NewVScroll(a.grid)
@@ -270,7 +301,7 @@ func (a *App) buildUI() {
 	a.emptyBox = container.NewCenter(emptyLbl)
 	a.rebuildGrid()
 
-	top := container.NewVBox(row1, row2, row3, a.vu)
+	top := container.NewVBox(row1, row2, row3, row4, a.vu)
 	body := container.NewStack(a.scroll, a.emptyBox)
 	verText := a.version
 	if verText != "" && verText[0] >= '0' && verText[0] <= '9' {
@@ -647,6 +678,9 @@ func (a *App) cardStatus(card *channelCard) string {
 	case rec != nil && !online:
 		return fmt.Sprintf("🔴 REC (black) %d f", rec.Frames())
 	case rec != nil:
+		if b := rec.Behind(); b > 2*int64(a.cfg.FPS) {
+			return fmt.Sprintf("🔴 REC %d f ⚠ %ds behind", rec.Frames(), b/int64(a.cfg.FPS))
+		}
 		return fmt.Sprintf("🔴 REC %d f", rec.Frames())
 	case online:
 		return fmt.Sprintf("🟢 %d×%d", w, h)
@@ -658,7 +692,8 @@ func (a *App) cardStatus(card *channelCard) string {
 }
 
 func (a *App) setControlsEnabled(enabled bool) {
-	ws := []fyne.Disableable{a.audioSel, a.codecSel, a.fpsSel, a.maxChSel, a.outEntry, a.browseBtn}
+	ws := []fyne.Disableable{a.audioSel, a.codecSel, a.fpsSel, a.maxChSel, a.outEntry, a.browseBtn,
+		a.sessionChk, a.tcChk, a.resolveChk}
 	for _, w := range ws {
 		if enabled {
 			w.Enable()
@@ -693,7 +728,11 @@ func (a *App) toggleRecord() {
 				a.recordBtn.SetIcon(theme.MediaRecordIcon())
 				a.recordBtn.Enable()
 				a.setControlsEnabled(true)
-				a.statusBar.SetText("Recording saved to " + a.cfg.OutDir)
+				dir := a.eng.SessionDir()
+				if dir == "" {
+					dir = a.cfg.OutDir
+				}
+				a.statusBar.SetText("Recording saved to " + dir)
 			})
 		}()
 		return
@@ -713,11 +752,14 @@ func (a *App) toggleRecord() {
 		audioEng = a.aud
 	}
 	set := recorder.Settings{
-		FFmpegPath: a.ffmpegPath,
-		OutDir:     a.cfg.OutDir,
-		FPS:        a.cfg.FPS,
-		Codec:      recorder.CodecByID(a.cfg.Codec),
-		Audio:      audioEng,
+		FFmpegPath:     a.ffmpegPath,
+		OutDir:         a.cfg.OutDir,
+		FPS:            a.cfg.FPS,
+		Codec:          recorder.CodecByID(a.cfg.Codec),
+		Audio:          audioEng,
+		Timecode:       a.cfg.Timecode,
+		SessionFolders: a.cfg.SessionFolders,
+		ResolveProject: a.cfg.ResolveProject,
 	}
 	n, err := a.eng.StartRecording(set)
 	if err != nil {
