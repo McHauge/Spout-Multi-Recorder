@@ -107,6 +107,7 @@ type App struct {
 	recStart time.Time
 	stopping bool
 	gridWide bool
+	version  string
 }
 
 type channelCard struct {
@@ -122,13 +123,14 @@ type channelCard struct {
 }
 
 // Run builds the window and blocks until the app exits.
-func Run(eng *engine.Engine, aud *audio.Engine) {
+func Run(eng *engine.Engine, aud *audio.Engine, version string) {
 	a := &App{
-		fapp:  app.NewWithID("com.mchauge.spoutmultirecorder"),
-		eng:   eng,
-		aud:   aud,
-		cfg:   LoadConfig(),
-		cards: map[string]*channelCard{},
+		version: version,
+		fapp:    app.NewWithID("com.mchauge.spoutmultirecorder"),
+		eng:     eng,
+		aud:     aud,
+		cfg:     LoadConfig(),
+		cards:   map[string]*channelCard{},
 	}
 	a.fapp.SetIcon(assets.Icon)
 	eng.SetMaxChannels(a.cfg.MaxChannels)
@@ -270,7 +272,13 @@ func (a *App) buildUI() {
 
 	top := container.NewVBox(row1, row2, row3, a.vu)
 	body := container.NewStack(a.scroll, a.emptyBox)
-	content := container.NewBorder(top, a.statusBar, nil, nil, body)
+	verText := a.version
+	if verText != "" && verText[0] >= '0' && verText[0] <= '9' {
+		verText = "v" + verText
+	}
+	verLbl := widget.NewLabel(verText)
+	bottom := container.NewBorder(nil, nil, nil, verLbl, a.statusBar)
+	content := container.NewBorder(top, bottom, nil, nil, body)
 	a.win.SetContent(content)
 }
 

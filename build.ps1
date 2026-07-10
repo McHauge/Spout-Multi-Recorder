@@ -11,7 +11,10 @@ $env:GOARCH = "amd64"
 
 New-Item -ItemType Directory -Force -Path dist | Out-Null
 
-go build -ldflags "-H windowsgui -s -w -extldflags '-static'" -o dist\SpoutMultiRecorder.exe .
+$version = (git describe --tags --always 2>$null) -replace '^v', ''
+if (-not $version) { $version = "dev" }
+
+go build -ldflags "-H windowsgui -s -w -X main.version=$version -extldflags '-static'" -o dist\SpoutMultiRecorder.exe .
 
 Write-Host "Built dist\SpoutMultiRecorder.exe"
 Write-Host "Remember to place ffmpeg.exe next to it or on PATH."

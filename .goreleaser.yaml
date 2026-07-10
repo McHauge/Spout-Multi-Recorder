@@ -37,6 +37,7 @@ builds:
       - -trimpath
     ldflags:
       - -s -w -H windowsgui
+      - -X main.version={{ .Version }}
       - -extldflags "-static"
 
 archives:
