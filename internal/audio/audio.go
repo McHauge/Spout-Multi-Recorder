@@ -173,6 +173,10 @@ func (e *Engine) Subscribe() (<-chan []byte, func()) {
 	}
 }
 
+// Channels reports the channel count of the captured stream (stereo).
+// Implements the recorder's AudioSource interface.
+func (e *Engine) Channels() int { return Channels }
+
 // Levels returns the current peak levels (0..1) for left and right.
 func (e *Engine) Levels() (l, r float64) {
 	return float64(e.peakL.Load()) / 1e6, float64(e.peakR.Load()) / 1e6

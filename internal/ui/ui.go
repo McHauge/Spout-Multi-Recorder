@@ -38,6 +38,8 @@ type Config struct {
 	MaxChannels   int      `json:"max_channels"`
 	AutoRecord    bool     `json:"auto_record"`
 	NDISources    []string `json:"ndi_sources"`
+	// Per-NDI-source master-audio preference (default false = native NDI audio).
+	NDIReplaceAudio map[string]bool `json:"ndi_replace_audio,omitempty"`
 }
 
 func configPath() string {
@@ -104,15 +106,19 @@ type App struct {
 	cards    map[string]*channelCard
 	recStart time.Time
 	stopping bool
+	gridWide bool
 }
 
 type channelCard struct {
-	ch      *engine.Channel
-	img     *canvas.Image
-	check   *widget.Check
-	status  *widget.Label
-	obj     fyne.CanvasObject
-	lastSeq uint64
+	ch        *engine.Channel
+	img       *canvas.Image
+	check     *widget.Check
+	audio     *widget.Check
+	audioInfo *widget.Label
+	meter     *MultiVU
+	status    *widget.Label
+	obj       fyne.CanvasObject
+	lastSeq   uint64
 }
 
 // Run builds the window and blocks until the app exits.
@@ -128,7 +134,7 @@ func Run(eng *engine.Engine, aud *audio.Engine) {
 	eng.SetMaxChannels(a.cfg.MaxChannels)
 	eng.SetAutoRecord(a.cfg.AutoRecord)
 	for _, n := range a.cfg.NDISources {
-		eng.AddNDI(n)
+		eng.AddNDI(n, a.cfg.NDIReplaceAudio[n])
 	}
 	a.ffmpegPath, a.ffmpegErr = recorder.FindFFmpeg()
 	if a.ffmpegErr == nil {
@@ -206,7 +212,7 @@ func (a *App) buildUI() {
 	})
 	a.maxChSel.SetSelected(strconv.Itoa(a.cfg.MaxChannels))
 
-	a.autoChk = widget.NewCheck("Auto-record new senders", func(v bool) {
+	a.autoChk = widget.NewCheck("Auto-record new Spout senders", func(v bool) {
 		a.cfg.AutoRecord = v
 		a.eng.SetAutoRecord(v)
 		a.cfg.save()
@@ -255,7 +261,7 @@ func (a *App) buildUI() {
 	)
 	row3 := container.NewBorder(nil, nil, widget.NewLabel("Save to:"), a.browseBtn, a.outEntry)
 
-	a.grid = container.NewGridWrap(fyne.NewSize(324, 262))
+	a.grid = container.NewGridWrap(fyne.NewSize(324, 300))
 	a.scroll = container.NewVScroll(a.grid)
 	emptyLbl := widget.NewLabel("Waiting for Spout senders…\nStart any Spout-enabled app and it will appear here.")
 	emptyLbl.Alignment = fyne.TextAlignCenter
@@ -338,13 +344,30 @@ func (a *App) rebuildGrid() {
 func (a *App) newCard(ch *engine.Channel) *channelCard {
 	img := canvas.NewImageFromImage(blackImage())
 	img.FillMode = canvas.ImageFillContain
-	img.SetMinSize(fyne.NewSize(308, 173))
+	img.SetMinSize(fyne.NewSize(278, 156))
+	meter := NewMultiVU()
 
 	check := widget.NewCheck("record", func(v bool) { ch.SetArmed(v) })
 	check.SetChecked(ch.Armed())
-	// While recording, arming only matters when auto-record can pick it up.
+
+	// "master audio": mux the master device into this channel's file. When
+	// off, NDI channels record their native audio; Spout channels get none.
+	audioChk := widget.NewCheck("master audio", func(v bool) {
+		ch.SetReplaceAudio(v)
+		if ch.NDI {
+			if a.cfg.NDIReplaceAudio == nil {
+				a.cfg.NDIReplaceAudio = map[string]bool{}
+			}
+			a.cfg.NDIReplaceAudio[ch.DisplayName()] = v
+			a.cfg.save()
+		}
+	})
+	audioChk.SetChecked(ch.ReplaceAudio())
+
+	// While recording, changes only matter when auto-record can pick them up.
 	if a.eng.Recording() && !a.cfg.AutoRecord {
 		check.Disable()
+		audioChk.Disable()
 	}
 	status := widget.NewLabel("⚫ waiting")
 
@@ -361,8 +384,41 @@ func (a *App) newCard(ch *engine.Channel) *channelCard {
 		header = container.NewBorder(nil, nil, nil, rm, name)
 	}
 
-	box := container.NewVBox(header, img, container.NewHBox(check, layout.NewSpacer(), status))
-	return &channelCard{ch: ch, img: img, check: check, status: status, obj: container.NewPadded(box)}
+	audioInfo := widget.NewLabel("")
+
+	preview := container.NewHBox(layout.NewSpacer(), img, meter, layout.NewSpacer())
+	box := container.NewVBox(header, preview,
+		container.NewHBox(check, layout.NewSpacer(), status),
+		container.NewHBox(audioChk, layout.NewSpacer(), audioInfo))
+	card := &channelCard{ch: ch, img: img, check: check, audio: audioChk, audioInfo: audioInfo, meter: meter, status: status, obj: container.NewPadded(box)}
+	audioInfo.SetText(a.cardAudioInfo(card))
+	return card
+}
+
+// cardAudioInfo describes the audio the next (or current) recording of this
+// channel gets, e.g. "2ch aac", "16ch opus" or "no audio".
+func (a *App) cardAudioInfo(card *channelCard) string {
+	codec := recorder.CodecByID(a.cfg.Codec)
+	var ch int
+	switch {
+	case card.ch.ReplaceAudio():
+		if !a.aud.Running() {
+			return "no audio"
+		}
+		ch = 2
+	case card.ch.NDI:
+		ch = card.ch.NativeAudioChannels()
+		if ch <= 0 {
+			ch = 2
+		}
+	default:
+		return "no audio"
+	}
+	name, maxCh := codec.AudioInfo()
+	if maxCh > 0 && ch > maxCh {
+		ch = maxCh
+	}
+	return fmt.Sprintf("%dch %s", ch, name)
 }
 
 // addNDISource browses the network and lets the user pick a source to add.
@@ -415,7 +471,7 @@ func (a *App) addNDISource() {
 						return
 					}
 					name := names[selected]
-					a.eng.AddNDI(name)
+					a.eng.AddNDI(name, a.cfg.NDIReplaceAudio[name])
 					found := false
 					for _, n := range a.cfg.NDISources {
 						if n == name {
@@ -447,17 +503,60 @@ func (a *App) removeNDISource(ch *engine.Channel) {
 		}
 	}
 	a.cfg.NDISources = out
+	delete(a.cfg.NDIReplaceAudio, name)
 	a.cfg.save()
 }
 
 func (a *App) startTickers() {
-	// VU meter, 20 Hz
+	// VU meters (master bar + per-preview channel meters), 20 Hz
 	go func() {
 		t := time.NewTicker(50 * time.Millisecond)
 		defer t.Stop()
 		for range t.C {
 			l, r := a.aud.Levels()
-			fyne.Do(func() { a.vu.SetLevels(l, r) })
+			masterOn := a.aud.Running()
+			type lv struct {
+				card   *channelCard
+				levels []float64
+			}
+			cards := a.snapshotCards()
+			ups := make([]lv, 0, len(cards))
+			for _, card := range cards {
+				var levels []float64
+				switch {
+				case card.ch.ReplaceAudio():
+					if masterOn {
+						levels = []float64{l, r}
+					}
+				case card.ch.NDI:
+					levels = card.ch.AudioLevels()
+				}
+				ups = append(ups, lv{card, levels})
+			}
+			anyWide := false
+			for _, u := range ups {
+				if len(u.levels) > 4 {
+					anyWide = true
+					break
+				}
+			}
+			fyne.Do(func() {
+				a.vu.SetLevels(l, r)
+				for _, u := range ups {
+					u.card.meter.SetLevels(u.levels)
+				}
+				// The preview image stays constant; when any channel needs
+				// the wide (8/16ch) meter, widen the grid columns instead.
+				if anyWide != a.gridWide {
+					a.gridWide = anyWide
+					w := float32(324)
+					if anyWide {
+						w = 352
+					}
+					a.grid.Layout = layout.NewGridWrapLayout(fyne.NewSize(w, 300))
+					a.grid.Refresh()
+				}
+			})
 		}
 	}()
 
@@ -507,6 +606,7 @@ func (a *App) startTickers() {
 			fyne.Do(func() {
 				for _, card := range cards {
 					card.status.SetText(a.cardStatus(card))
+					card.audioInfo.SetText(a.cardAudioInfo(card))
 				}
 				if recording {
 					d := time.Since(a.recStart).Round(time.Second)
@@ -561,8 +661,10 @@ func (a *App) setControlsEnabled(enabled bool) {
 	for _, c := range a.cards {
 		if enabled || a.cfg.AutoRecord {
 			c.check.Enable()
+			c.audio.Enable()
 		} else {
 			c.check.Disable()
+			c.audio.Disable()
 		}
 	}
 }

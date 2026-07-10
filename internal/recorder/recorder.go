@@ -28,7 +28,16 @@ type Settings struct {
 	OutDir     string
 	FPS        int
 	Codec      Codec
-	Audio      *audio.Engine // nil = record without audio
+	Audio      *audio.Engine // master audio device (used per channel-preference)
+}
+
+// AudioSource provides the interleaved s16le 48 kHz PCM stream muxed into a
+// recording. Implemented by *audio.Engine (master device, stereo) and by the
+// engine's NDI audio pump (native NDI audio, source channel count).
+// Channels must be called after Subscribe (the format locks on subscription).
+type AudioSource interface {
+	Subscribe() (<-chan []byte, func())
+	Channels() int
 }
 
 // Recorder records a single channel.
@@ -64,7 +73,9 @@ var pipeCounter atomic.Int64
 // Start begins recording the given channel. The video size is fixed at the
 // channel's current dimensions for the duration of the recording; if the
 // sender changes size mid-recording, frames are centered/cropped to fit.
-func Start(name string, buf *frame.Buffer, set Settings) (*Recorder, error) {
+// audioSrc selects this channel's audio (master device, NDI native audio,
+// or nil for no audio track).
+func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource) (*Recorder, error) {
 	w, h, format, connected := buf.Dims()
 	if w == 0 || h == 0 {
 		return nil, fmt.Errorf("%s: no frame received yet, cannot determine size", name)
@@ -87,7 +98,17 @@ func Start(name string, buf *frame.Buffer, set Settings) (*Recorder, error) {
 		file: file, stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
 
-	withAudio := set.Audio != nil && set.Audio.Running()
+	withAudio := audioSrc != nil
+	var sub <-chan []byte
+	audioCh := audio.Channels
+	if withAudio {
+		// Subscribe first: this locks the source's stream format so the
+		// channel count passed to FFmpeg matches the delivered PCM.
+		s, unsub := audioSrc.Subscribe()
+		sub = s
+		r.unsub = unsub
+		audioCh = audioSrc.Channels()
+	}
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y",
@@ -104,13 +125,13 @@ func Start(name string, buf *frame.Buffer, set Settings) (*Recorder, error) {
 		args = append(args,
 			"-f", "s16le",
 			"-ar", strconv.Itoa(audio.SampleRate),
-			"-ac", strconv.Itoa(audio.Channels),
+			"-ac", strconv.Itoa(audioCh),
 			"-thread_queue_size", "512",
 			"-i", pipeName,
 		)
 	}
 
-	args = append(args, videoArgs(set.Codec, withAudio)...)
+	args = append(args, videoArgs(set.Codec, withAudio, audioCh)...)
 	if withAudio {
 		args = append(args, "-map", "0:v", "-map", "1:a", "-shortest")
 	}
@@ -120,11 +141,10 @@ func Start(name string, buf *frame.Buffer, set Settings) (*Recorder, error) {
 	if withAudio {
 		lis, err := winio.ListenPipe(pipeName, nil)
 		if err != nil {
+			r.cleanupAudio()
 			return nil, fmt.Errorf("%s: create audio pipe: %w", name, err)
 		}
 		r.pipeLis = lis
-		sub, unsub := set.Audio.Subscribe()
-		r.unsub = unsub
 		go func() {
 			conn, err := lis.Accept()
 			if err != nil {

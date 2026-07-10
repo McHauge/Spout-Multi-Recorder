@@ -43,6 +43,19 @@ type recvCreateV3T struct {
 	pRecvName       *byte
 }
 
+type audioFrameV2T struct {
+	sampleRate    int32
+	noChannels    int32
+	noSamples     int32
+	_             [4]byte
+	timecode      int64
+	pData         *byte // planar float32
+	channelStride int32
+	_             [4]byte
+	pMetadata     *byte
+	timestamp     int64
+}
+
 type videoFrameV2T struct {
 	xres, yres             int32
 	fourCC                 uint32
@@ -60,9 +73,16 @@ type videoFrameV2T struct {
 
 const (
 	frameTypeVideo = 1
+	frameTypeAudio = 2
 
 	colorFormatBGRXBGRA = 0
 	bandwidthHighest    = 100
+
+	// Output audio format (matches the recorder pipeline).
+	OutSampleRate = 48000
+	// MaxChannels caps how many source audio channels are preserved.
+	// NDI sources in the wild use 2/4/8, occasionally 16.
+	MaxChannels = 16
 )
 
 // ---- runtime loading ----
@@ -80,6 +100,7 @@ var (
 	pRecvDestroy    *windows.Proc
 	pRecvCapture    *windows.Proc
 	pRecvFreeVideo  *windows.Proc
+	pRecvFreeAudio  *windows.Proc
 	pRecvNoConns    *windows.Proc
 )
 
@@ -135,6 +156,7 @@ func load() error {
 		pRecvDestroy = get("NDIlib_recv_destroy")
 		pRecvCapture = get("NDIlib_recv_capture_v2")
 		pRecvFreeVideo = get("NDIlib_recv_free_video_v2")
+		pRecvFreeAudio = get("NDIlib_recv_free_audio_v2")
 		pRecvNoConns = get("NDIlib_recv_get_no_connections")
 		if loadErr != nil {
 			return
@@ -217,9 +239,10 @@ func FindSources(timeout time.Duration) ([]Source, error) {
 // Receiver receives video frames from one NDI source.
 // Must be used from a single goroutine.
 type Receiver struct {
-	inst    uintptr
-	keep    []*byte // keeps C strings alive
-	scratch []byte
+	inst     uintptr
+	keep     []*byte // keeps C strings alive
+	scratch  []byte
+	ascratch []byte
 }
 
 // NewReceiver connects to the given source (BGRA video, highest bandwidth).
@@ -260,11 +283,41 @@ func (r *Receiver) Capture(timeout time.Duration) (pix []byte, w, h int, ok bool
 		return nil, 0, 0, false
 	}
 	defer pRecvFreeVideo.Call(r.inst, uintptr(unsafe.Pointer(&vf)))
+	pix, w, h = r.copyVideo(&vf)
+	return pix, w, h, pix != nil
+}
 
+// CaptureAV waits up to timeout for a frame. Exactly one of pix (BGRA video,
+// with w/h) or aud (interleaved s16le 48 kHz PCM with audCh channels) is
+// non-nil, or both are nil on timeout. Slices are valid until the next call.
+func (r *Receiver) CaptureAV(timeout time.Duration) (pix []byte, w, h int, aud []byte, audCh int) {
+	var vf videoFrameV2T
+	var af audioFrameV2T
+	ft, _, _ := pRecvCapture.Call(
+		r.inst,
+		uintptr(unsafe.Pointer(&vf)),
+		uintptr(unsafe.Pointer(&af)),
+		0,
+		uintptr(timeout.Milliseconds()),
+	)
+	switch int32(ft) {
+	case frameTypeVideo:
+		defer pRecvFreeVideo.Call(r.inst, uintptr(unsafe.Pointer(&vf)))
+		pix, w, h = r.copyVideo(&vf)
+		return pix, w, h, nil, 0
+	case frameTypeAudio:
+		defer pRecvFreeAudio.Call(r.inst, uintptr(unsafe.Pointer(&af)))
+		aud, audCh = r.convertAudio(&af)
+		return nil, 0, 0, aud, audCh
+	}
+	return nil, 0, 0, nil, 0
+}
+
+func (r *Receiver) copyVideo(vf *videoFrameV2T) (pix []byte, w, h int) {
 	w, h = int(vf.xres), int(vf.yres)
 	stride := int(vf.stride)
 	if w <= 0 || h <= 0 || vf.pData == nil || stride < w*4 {
-		return nil, 0, 0, false
+		return nil, 0, 0
 	}
 	need := w * h * 4
 	if cap(r.scratch) < need {
@@ -279,7 +332,63 @@ func (r *Receiver) Capture(timeout time.Duration) (pix []byte, w, h int, ok bool
 			copy(r.scratch[y*w*4:(y+1)*w*4], src[y*stride:y*stride+w*4])
 		}
 	}
-	return r.scratch, w, h, true
+	return r.scratch, w, h
+}
+
+// convertAudio converts NDI planar float32 audio to interleaved s16le at
+// 48 kHz, preserving the source channel count (capped at MaxChannels;
+// nearest-sample resampling if the source rate differs).
+func (r *Receiver) convertAudio(af *audioFrameV2T) ([]byte, int) {
+	ns := int(af.noSamples)
+	srcCh := int(af.noChannels)
+	rate := int(af.sampleRate)
+	if ns <= 0 || srcCh <= 0 || rate <= 0 || af.pData == nil {
+		return nil, 0
+	}
+	ch := srcCh
+	if ch > MaxChannels {
+		ch = MaxChannels
+	}
+	strideF := int(af.channelStride) / 4
+	if strideF < ns {
+		strideF = ns
+	}
+	data := unsafe.Slice((*float32)(unsafe.Pointer(af.pData)), (srcCh-1)*strideF+ns)
+	outN := ns
+	if rate != OutSampleRate {
+		outN = ns * OutSampleRate / rate
+		if outN <= 0 {
+			return nil, 0
+		}
+	}
+	need := outN * ch * 2
+	if cap(r.ascratch) < need {
+		r.ascratch = make([]byte, need)
+	}
+	out := r.ascratch[:need]
+	for i := 0; i < outN; i++ {
+		si := i
+		if outN != ns {
+			si = i * ns / outN
+		}
+		base := i * ch * 2
+		for c := 0; c < ch; c++ {
+			v := f32toS16(data[c*strideF+si])
+			out[base+c*2] = byte(v)
+			out[base+c*2+1] = byte(v >> 8)
+		}
+	}
+	return out, ch
+}
+
+func f32toS16(f float32) int16 {
+	v := int32(f * 32767)
+	if v > 32767 {
+		v = 32767
+	} else if v < -32768 {
+		v = -32768
+	}
+	return int16(v)
 }
 
 // Connections returns the number of senders currently connected (0 = source gone).

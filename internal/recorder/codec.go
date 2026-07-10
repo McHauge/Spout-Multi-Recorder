@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"fmt"
 	"os/exec"
 	"strings"
 )
@@ -17,9 +18,24 @@ var Codecs = []Codec{
 	{ID: "h264", Label: "H.264 (auto hardware)", Ext: "mp4"},
 	{ID: "h264_sw", Label: "H.264 (software x264)", Ext: "mp4"},
 	{ID: "hevc", Label: "HEVC / H.265 (auto hardware)", Ext: "mp4"},
+	{ID: "h264_mkv", Label: "H.264 + Opus (MKV, multichannel)", Ext: "mkv"},
+	{ID: "hevc_mkv", Label: "HEVC + Opus (MKV, multichannel)", Ext: "mkv"},
 	{ID: "prores", Label: "ProRes 422 HQ (editing)", Ext: "mov"},
 	{ID: "dnxhr", Label: "DNxHR HQ (editing)", Ext: "mov"},
 	{ID: "mjpeg", Label: "MJPEG (low CPU, big files)", Ext: "mov"},
+}
+
+// AudioInfo returns the audio codec short name and its channel limit
+// (0 = no practical limit) for this preset's container.
+func (c Codec) AudioInfo() (name string, maxCh int) {
+	switch c.Ext {
+	case "mov":
+		return "pcm", 0
+	case "mkv":
+		return "opus", 0 // mapping family 255 carries up to 255 channels
+	default:
+		return "aac", 8
+	}
 }
 
 // CodecByID returns the codec with the given ID, defaulting to h264.
@@ -59,9 +75,19 @@ func hasEncoder(name string) bool {
 
 // videoArgs returns the FFmpeg output arguments (video + audio codecs) for a
 // codec preset. Hardware encoders are picked in order NVENC > QSV > AMF.
-func videoArgs(c Codec, withAudio bool) []string {
+// audioCh is the input audio channel count; AAC (mp4) is limited to 8
+// channels, so higher counts are downmixed there (PCM in MOV keeps all).
+func videoArgs(c Codec, withAudio bool, audioCh int) []string {
 	var v []string
-	switch c.ID {
+	// MKV presets reuse the mp4 video encoder selection.
+	id := c.ID
+	switch id {
+	case "h264_mkv":
+		id = "h264"
+	case "hevc_mkv":
+		id = "hevc"
+	}
+	switch id {
 	case "h264":
 		switch {
 		case hasEncoder("h264_nvenc"):
@@ -100,8 +126,17 @@ func videoArgs(c Codec, withAudio bool) []string {
 		switch c.Ext {
 		case "mov":
 			v = append(v, "-c:a", "pcm_s16le")
+		case "mkv":
+			// ~64 kbit/s per channel; discrete mapping beyond 8 channels.
+			v = append(v, "-c:a", "libopus", "-b:a", fmt.Sprintf("%dk", 64*max(audioCh, 1)))
+			if audioCh > 8 {
+				v = append(v, "-mapping_family", "255")
+			}
 		default:
 			v = append(v, "-c:a", "aac", "-b:a", "192k")
+			if audioCh > 8 {
+				v = append(v, "-ac", "8") // AAC caps at 8 channels
+			}
 		}
 	}
 	return v

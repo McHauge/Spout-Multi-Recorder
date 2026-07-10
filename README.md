@@ -1,6 +1,6 @@
 # Spout Multi Recorder
 
-Records **all [Spout](https://spout.zeal.co/) video streams** on a PC to disk simultaneously, embedding **one shared master audio track** (any input device, or speaker loopback — "what you hear") into every file.
+Records **all [Spout](https://spout.zeal.co/) video streams** on a PC — plus any **[NDI](https://ndi.video)® sources** on the network — to disk simultaneously, each stream to its own file, with flexible per-channel audio.
 
 Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutDX, vendored under `internal/spout/`) via cgo, WASAPI audio capture via [malgo](https://github.com/gen2brain/malgo), FFmpeg for encoding, and a [Fyne](https://fyne.io) desktop UI.
 
@@ -8,19 +8,47 @@ Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutD
 
 ## Features
 
-- Auto-discovers every Spout sender on the machine; each gets a live preview card.
-- Records any number of channels at once (cap selectable via **Max channels**).
-- One master audio source — microphone/line input or speaker loopback — muxed into *all* recordings, with a stereo VU meter.
-- Codec selectable in the UI: H.264 / HEVC (NVENC, QuickSync or AMF hardware encoding picked automatically, x264/x265 fallback), ProRes 422 HQ, DNxHR HQ, MJPEG.
-- Robust to senders dropping out: recording simply continues with **black frames** at constant framerate, and picks the stream back up when the sender returns (even at a new resolution — frames are centered/cropped).
-- **Auto-record new senders**: while a session is running, any sender that appears is automatically armed and gets its own recording file (you can even hit Record with zero senders and let them join as they start up).
-- **NDI support** (full NDI *and* NDI|HX): manually add network sources via the **Add NDI** button — pick from discovered sources, and they become recordable channels just like Spout senders (remembered across restarts, removable via the ✕ on the card). Requires the [NDI runtime](https://ndi.video/tools/) on the machine; HX decoding is handled by the runtime. NDI's embedded audio is not used — the master audio source is recorded into every file.
-- Each stream records at its native resolution. Files are named `<sender>_<timestamp>.<ext>`.
+- Records any number of channels at once, each at its native resolution, to `<sender>_<timestamp>.<ext>`. Live preview cards with per-channel VU meters.
+- Robust to sources dropping out: recording continues with **black frames** (and silence) at constant framerate, and picks the stream back up when the source returns — even at a new resolution (frames are centered/cropped).
+- **Auto-record**: while a session is running, new Spout senders are automatically armed and get their own file. You can even hit Record with zero senders and let them join as they start up.
+- Settings persist between runs (`%APPDATA%\SpoutMultiRecorder\config.json`, log next to it).
+
+### Video sources
+
+- **Spout**: every sender on the machine is discovered automatically and appears as a preview card within a second (up to **Max channels** are auto-armed).
+- **NDI** — full-bandwidth NDI *and* NDI|HX: added manually via the **Add NDI** button, which lists the sources discovered on the network. Added sources are remembered across restarts and removable via the 🗑 button on the card. Receivers connect by source name, so they survive the sending application restarting (reconnects automatically, including on a new address). Requires the [NDI runtime](https://ndi.video/tools/) on the machine; HX decoding is handled by the runtime.
+
+### Audio
+
+- One **master audio source** — any input device or speaker loopback (🔊 "what you hear") — selectable in the toolbar, with a stereo VU meter.
+- **Per-channel audio choice** via the **master audio** checkbox on each card:
+  - *Checked* (default for Spout, which carries no audio): the master source is muxed into that channel's file.
+  - *Unchecked* (default for NDI): NDI channels record their **native embedded NDI audio**; Spout channels record without an audio track.
+- **Multichannel NDI audio**: the source's channel count is preserved — 2/4/8/16 channels (capped at 16), converted to 48 kHz s16 and silence-padded during dropouts so files never desync. The channel count locks when a recording starts; if the source changes mid-recording the stream is adapted (extra channels dropped, missing ones silent).
+- Each card shows exactly what will be recorded (e.g. `2ch aac`, `8ch opus`, `16ch pcm`, `no audio`) plus a live per-channel VU meter beside the preview — one bar per audio channel for native NDI audio, a vertical mirror of the master meter when master audio is selected. No meter = no audio track.
+
+### Codecs (selectable in the UI)
+
+| Preset | Container | Audio | Notes |
+|---|---|---|---|
+| H.264 / HEVC (auto hardware) | MP4 | AAC | NVENC → QuickSync → AMF, x264/x265 fallback. AAC caps at 8 audio channels (auto-downmix). |
+| H.264 / HEVC + Opus | MKV | Opus | Same video encoders; Opus carries the full channel count (~64 kbit/s per channel). |
+| ProRes 422 HQ, DNxHR HQ, MJPEG | MOV | PCM | Editing-friendly; PCM keeps all channels uncompressed. |
 
 ## Runtime requirements
 
 - Windows 10/11 x64, DirectX 11 capable GPU.
-- `ffmpeg.exe` — place it next to `SpoutMultiRecorder.exe` or anywhere on `PATH` (e.g. from <https://www.gyan.dev/ffmpeg/builds/>, the "essentials" build is fine).
+- `ffmpeg.exe` — next to `SpoutMultiRecorder.exe` or on `PATH` (e.g. `winget install ffmpeg`, or the [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) "essentials" build).
+- For NDI: the [NDI runtime](https://ndi.video/tools/) (bundled with NDI Tools). Optional — without it, only the NDI features are unavailable.
+
+## Using it
+
+1. Start the app. Running Spout senders appear automatically; add NDI sources with **Add NDI**.
+2. Pick the **Audio** master source (🔊 = speaker loopback, 🎤 = input) — the VU meter confirms signal — and set the per-card **master audio** checkboxes as needed.
+3. Pick **Codec**, **FPS**, **Max channels** and the output folder.
+4. Tick **record** on the channels you want, press **Record**, later **Stop**. Every armed channel becomes its own file.
+
+Good test senders: the *Spout Demo Sender* from the Spout distribution, OBS (Spout2 plugin or NDI output), Resolume, TouchDesigner.
 
 ## Building
 
@@ -64,19 +92,10 @@ go install github.com/tc-hib/go-winres@latest
 go-winres make --in winres/winres.json --arch amd64
 ```
 
-## Using it
-
-1. Start the app. Any running Spout senders appear as preview cards within a second (test with the *Spout Demo Sender* from the [Spout distribution](https://spout.zeal.co/), OBS with the Spout2 plugin, Resolume, TouchDesigner, …).
-2. Pick the **Audio** source — entries marked 🔊 are speaker loopback ("what you hear"), 🎤 are inputs. The VU meter confirms signal.
-3. Pick **Codec**, **FPS**, **Max channels** and the output folder.
-4. Tick **record** on the channels you want (new senders auto-arm up to the max), press **Record**, later press **Stop**. Every armed channel becomes its own file with the same audio.
-
-Settings persist in `%APPDATA%\SpoutMultiRecorder\config.json`; a log is written next to it.
-
 ## Notes & limitations
 
-- Float-format senders (e.g. RGBA16F/RGBA32F) are rare and not converted; 8-bit BGRA/RGBA senders (the default) are fully supported.
-- If a sender changes resolution mid-recording the file keeps its original size; frames are centered (padded/cropped), since a video file cannot change resolution mid-stream.
-- Audio/video both start when you press Record and stay aligned; extremely long sessions may accumulate a small drift (audio is clocked by the sound device, video by the wall clock).
+- Float-format Spout senders (e.g. RGBA16F/RGBA32F) are rare and not converted; 8-bit BGRA/RGBA senders (the default) are fully supported.
+- If a source changes resolution mid-recording the file keeps its original size; frames are centered (padded/cropped), since a video file cannot change resolution mid-stream.
+- Audio/video both start when you press Record and stay aligned; extremely long sessions may accumulate a small drift (audio is clocked by the source, video by the wall clock). NDI audio at rates other than 48 kHz is resampled with a simple nearest-sample pass.
 - The Spout2 SDK sources in `internal/spout/` are BSD-licensed by Lynn Jarvis — see `internal/spout/SPOUT_LICENSE.txt`.
 - NDI® is a registered trademark of Vizrt NDI AB. The app loads the NDI runtime DLL dynamically at runtime (nothing NDI-related is compiled in or redistributed); without the runtime installed, NDI features are simply unavailable.

@@ -26,9 +26,11 @@ type Channel struct {
 	NDI  bool
 	Buf  *frame.Buffer
 
-	armed    atomic.Bool
-	online   atomic.Bool
-	lastSeen atomic.Int64 // unix nano of last time the sender name was listed
+	armed        atomic.Bool
+	online       atomic.Bool
+	replaceAudio atomic.Bool  // record master device audio instead of source audio
+	pump         *audioPump   // native audio fanout (NDI channels only)
+	lastSeen     atomic.Int64 // unix nano of last time the sender name was listed
 
 	mu  sync.Mutex
 	rec *recorder.Recorder
@@ -49,6 +51,32 @@ func (c *Channel) Online() bool { return c.online.Load() }
 
 // DisplayName is the channel name without the NDI namespace prefix.
 func (c *Channel) DisplayName() string { return strings.TrimPrefix(c.Name, NDIPrefix) }
+
+// NativeAudioChannels reports the channel count of the source's own audio
+// stream (NDI only; 0 when unknown or not an NDI channel).
+func (c *Channel) NativeAudioChannels() int {
+	if c.pump == nil {
+		return 0
+	}
+	return c.pump.Channels()
+}
+
+// AudioLevels returns per-channel peaks (0..1) of the source's native audio,
+// or nil for channels without their own audio.
+func (c *Channel) AudioLevels() []float64 {
+	if c.pump == nil {
+		return nil
+	}
+	return c.pump.Levels()
+}
+
+// ReplaceAudio reports whether this channel records the master audio device.
+// When false, NDI channels record their native embedded audio instead and
+// Spout channels (which carry no audio) record without an audio track.
+func (c *Channel) ReplaceAudio() bool { return c.replaceAudio.Load() }
+
+// SetReplaceAudio changes the audio preference (affects the next recording).
+func (c *Channel) SetReplaceAudio(v bool) { c.replaceAudio.Store(v) }
 
 // Recorder returns the active recorder, or nil.
 func (c *Channel) Recorder() *recorder.Recorder {
@@ -77,6 +105,7 @@ func (c *Channel) captureNDI() {
 		return
 	}
 	name := c.DisplayName()
+	go c.pump.run(c.stop)
 	var rx *ndi.Receiver
 	defer func() {
 		if rx != nil {
@@ -84,6 +113,7 @@ func (c *Channel) captureNDI() {
 		}
 	}()
 	var lastFrame time.Time
+	var lastAny time.Time
 	for {
 		select {
 		case <-c.stop:
@@ -91,32 +121,11 @@ func (c *Channel) captureNDI() {
 		default:
 		}
 		if rx == nil {
-			// Resolve the source on the network, then connect once; the NDI
-			// receiver reconnects automatically if the source drops later.
-			srcs, err := ndi.FindSources(2 * time.Second)
-			if err != nil {
-				log.Printf("channel %s: %v", c.Name, err)
-				if !c.sleepStop(5 * time.Second) {
-					return
-				}
-				continue
-			}
-			var found *ndi.Source
-			for i := range srcs {
-				if srcs[i].Name == name {
-					found = &srcs[i]
-					break
-				}
-			}
-			if found == nil {
-				c.online.Store(false)
-				c.Buf.SetConnected(false)
-				if !c.sleepStop(2 * time.Second) {
-					return
-				}
-				continue
-			}
-			r, err := ndi.NewReceiver(*found)
+			// Create the receiver with the source *name* only: the NDI
+			// runtime then runs its own discovery inside the receiver and
+			// (re)connects whenever the source appears — including after the
+			// sending application restarts on a new URL/port.
+			r, err := ndi.NewReceiver(ndi.Source{Name: name})
 			if err != nil {
 				log.Printf("channel %s: %v", c.Name, err)
 				if !c.sleepStop(5 * time.Second) {
@@ -125,16 +134,32 @@ func (c *Channel) captureNDI() {
 				continue
 			}
 			rx = r
-			log.Printf("NDI connected: %q", name)
+			lastAny = time.Now()
+			log.Printf("NDI receiver created for %q, waiting for source", name)
 		}
-		pix, w, h, ok := rx.Capture(250 * time.Millisecond)
-		if ok {
+		pix, w, h, aud, audCh := rx.CaptureAV(250 * time.Millisecond)
+		switch {
+		case pix != nil:
 			c.online.Store(true)
 			c.Buf.Store(pix, w, h, spout.FormatBGRA8, true)
 			lastFrame = time.Now()
-		} else if rx.Connections() == 0 || time.Since(lastFrame) > 3*time.Second {
-			c.online.Store(false)
-			c.Buf.SetConnected(false)
+			lastAny = lastFrame
+		case aud != nil:
+			c.pump.push(aud, audCh)
+			lastAny = time.Now()
+		default:
+			if rx.Connections() == 0 || time.Since(lastFrame) > 3*time.Second {
+				c.online.Store(false)
+				c.Buf.SetConnected(false)
+			}
+			// Safety net: the receiver's internal discovery normally handles
+			// reconnects itself; if it somehow gets stuck, rebuild it after a
+			// longer silence.
+			if time.Since(lastAny) > 30*time.Second {
+				log.Printf("NDI %q silent for 30s, rebuilding receiver", name)
+				rx.Close()
+				rx = nil
+			}
 		}
 	}
 }
@@ -255,6 +280,7 @@ func (e *Engine) discoveryLoop() {
 				done: make(chan struct{}),
 			}
 			c.lastSeen.Store(now)
+			c.replaceAudio.Store(true) // Spout has no audio: use master device
 			armedCount := 0
 			for _, name := range e.order {
 				if e.channels[name].Armed() {
@@ -312,7 +338,7 @@ func (e *Engine) discoveryLoop() {
 				if w == 0 || h == 0 {
 					continue
 				}
-				rec, err := recorder.Start(c.Name, c.Buf, e.recSet)
+				rec, err := recorder.Start(c.Name, c.Buf, e.recSet, e.audioSourceFor(c, e.recSet))
 				if err != nil {
 					log.Printf("auto-record %s: %v", n, err)
 					continue
@@ -333,7 +359,8 @@ func (e *Engine) discoveryLoop() {
 }
 
 // AddNDI adds a manually selected NDI source as a channel (idempotent).
-func (e *Engine) AddNDI(sourceName string) {
+// replaceAudio=false records the source's native NDI audio.
+func (e *Engine) AddNDI(sourceName string, replaceAudio bool) {
 	key := NDIPrefix + sourceName
 	e.mu.Lock()
 	if _, ok := e.channels[key]; ok {
@@ -344,11 +371,13 @@ func (e *Engine) AddNDI(sourceName string) {
 		Name: key,
 		NDI:  true,
 		Buf:  &frame.Buffer{},
+		pump: newAudioPump(),
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
 	c.lastSeen.Store(time.Now().UnixNano())
 	c.SetArmed(true)
+	c.replaceAudio.Store(replaceAudio)
 	e.channels[key] = c
 	e.order = append(e.order, key)
 	sort.Strings(e.order)
@@ -431,7 +460,7 @@ func (e *Engine) StartRecording(set recorder.Settings) (int, error) {
 			log.Printf("skipping %s: no frame received yet", n)
 			continue
 		}
-		rec, err := recorder.Start(c.Name, c.Buf, set)
+		rec, err := recorder.Start(c.Name, c.Buf, set, e.audioSourceFor(c, set))
 		if err != nil {
 			log.Printf("start %s: %v", n, err)
 			if firstErr == nil {
@@ -458,6 +487,22 @@ func (e *Engine) StartRecording(set recorder.Settings) (int, error) {
 		firstErr = fmt.Errorf("no armed channels with frames to record")
 	}
 	return 0, firstErr
+}
+
+// audioSourceFor picks the audio for one channel's recording: the master
+// device when the channel replaces audio (and a device is running), the
+// channel's native NDI audio otherwise, or none.
+func (e *Engine) audioSourceFor(c *Channel, set recorder.Settings) recorder.AudioSource {
+	if c.ReplaceAudio() {
+		if set.Audio != nil && set.Audio.Running() {
+			return set.Audio
+		}
+		return nil
+	}
+	if c.NDI && c.pump != nil {
+		return c.pump
+	}
+	return nil
 }
 
 // StopRecording stops all recorders (in parallel) and waits for the files to
