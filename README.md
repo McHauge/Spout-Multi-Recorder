@@ -35,7 +35,8 @@ Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutD
 | Preset | Container | Audio | Notes |
 |---|---|---|---|
 | H.264 / HEVC (auto hardware) | MP4 | AAC | NVENC → QuickSync → AMF, x264/x265 fallback. AAC caps at 8 audio channels (auto-downmix). |
-| H.264 / HEVC + Opus | MKV | Opus | Same video encoders; Opus carries the full channel count (~64 kbit/s per channel). |
+| AV1 (auto hardware) | MP4 | AAC | NVENC → QuickSync → AMF, SVT-AV1 software fallback. Smaller files at equal quality; HW AV1 needs recent silicon (NVENC: RTX 40-series, AMF: RDNA3+, QSV: Arc/Meteor Lake+). |
+| H.264 / HEVC / AV1 + Opus | MKV | Opus | Same video encoders; Opus carries the full channel count (~64 kbit/s per channel). |
 | ProRes 422 HQ, DNxHR HQ, MJPEG | MOV | PCM | Editing-friendly; PCM keeps all channels uncompressed. |
 
 ## Runtime requirements

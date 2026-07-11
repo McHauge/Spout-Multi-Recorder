@@ -18,8 +18,10 @@ var Codecs = []Codec{
 	{ID: "h264", Label: "H.264 (auto hardware)", Ext: "mp4"},
 	{ID: "h264_sw", Label: "H.264 (software x264)", Ext: "mp4"},
 	{ID: "hevc", Label: "HEVC / H.265 (auto hardware)", Ext: "mp4"},
+	{ID: "av1", Label: "AV1 (auto hardware)", Ext: "mp4"},
 	{ID: "h264_mkv", Label: "H.264 + Opus (MKV, multichannel)", Ext: "mkv"},
 	{ID: "hevc_mkv", Label: "HEVC + Opus (MKV, multichannel)", Ext: "mkv"},
+	{ID: "av1_mkv", Label: "AV1 + Opus (MKV, multichannel)", Ext: "mkv"},
 	{ID: "prores", Label: "ProRes 422 HQ (editing)", Ext: "mov"},
 	{ID: "dnxhr", Label: "DNxHR HQ (editing)", Ext: "mov"},
 	{ID: "mjpeg", Label: "MJPEG (low CPU, big files)", Ext: "mov"},
@@ -86,6 +88,8 @@ func videoArgs(c Codec, withAudio bool, audioCh int) []string {
 		id = "h264"
 	case "hevc_mkv":
 		id = "hevc"
+	case "av1_mkv":
+		id = "av1"
 	}
 	switch id {
 	case "h264":
@@ -111,6 +115,17 @@ func videoArgs(c Codec, withAudio bool, audioCh int) []string {
 			v = []string{"-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "23", "-qp_p", "25", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
 		default:
 			v = []string{"-c:v", "libx265", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+		}
+	case "av1":
+		switch {
+		case hasEncoder("av1_nvenc"):
+			v = []string{"-c:v", "av1_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "27", "-b:v", "0", "-pix_fmt", "yuv420p"}
+		case hasEncoder("av1_qsv"):
+			v = []string{"-c:v", "av1_qsv", "-global_quality", "27", "-pix_fmt", "nv12"}
+		case hasEncoder("av1_amf"):
+			v = []string{"-c:v", "av1_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "27", "-qp_p", "29", "-pix_fmt", "yuv420p"}
+		default:
+			v = []string{"-c:v", "libsvtav1", "-preset", "8", "-crf", "30", "-pix_fmt", "yuv420p"}
 		}
 	case "prores":
 		v = []string{"-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"}
