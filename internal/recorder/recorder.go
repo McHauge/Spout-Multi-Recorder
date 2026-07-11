@@ -20,6 +20,7 @@ import (
 
 	"github.com/McHauge/Spout-Multi-Recorder/internal/audio"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/frame"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/hwstat"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/resolve"
 )
 
@@ -64,6 +65,7 @@ type Recorder struct {
 	startTime   time.Time // wall-clock instant frame 0 corresponds to
 	startFrames int64     // start timecode as frames since midnight
 	audioCh     int       // audio channels in the file (0 = no audio track)
+	vendor      hwstat.Vendor // encoder backend chosen by the load balancer
 	cmd         *exec.Cmd
 	stopCh      chan struct{}
 	doneCh      chan struct{}
@@ -82,6 +84,7 @@ type Info struct {
 	StartFrames int64 // start timecode as frames since midnight
 	Frames      int64 // video frames written
 	AudioCh     int   // audio channels in the file (0 = none)
+	Vendor      hwstat.Vendor // encoder backend used (nvenc/amd/intel/cpu)
 }
 
 // Info returns the recording's metadata (safe after Stop; Frames is a live
@@ -90,6 +93,7 @@ func (r *Recorder) Info() Info {
 	return Info{
 		Name: r.name, File: r.file, W: r.w, H: r.h, FPS: r.set.FPS,
 		StartFrames: r.startFrames, Frames: r.frames.Load(), AudioCh: r.audioCh,
+		Vendor: r.vendor,
 	}
 }
 
@@ -109,8 +113,9 @@ var pipeCounter atomic.Int64
 // channel's current dimensions for the duration of the recording; if the
 // sender changes size mid-recording, frames are centered/cropped to fit.
 // audioSrc selects this channel's audio (master device, NDI native audio,
-// or nil for no audio track).
-func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource) (*Recorder, error) {
+// or nil for no audio track). vendor is the encoder backend chosen by the
+// load balancer (falls back to software if unavailable in this ffmpeg build).
+func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource, vendor hwstat.Vendor) (*Recorder, error) {
 	w, h, format, connected := buf.Dims()
 	if w == 0 || h == 0 {
 		return nil, fmt.Errorf("%s: no frame received yet, cannot determine size", name)
@@ -130,7 +135,7 @@ func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource) (
 	file := filepath.Join(set.OutDir, fmt.Sprintf("%s_%s.%s", sanitize(name), ts, set.Codec.Ext))
 
 	r := &Recorder{
-		name: name, buf: buf, set: set, w: w, h: h, pixFmt: pixFmt,
+		name: name, buf: buf, set: set, w: w, h: h, pixFmt: pixFmt, vendor: vendor,
 		file: file, startTime: now, startFrames: resolve.FramesSinceMidnight(now, set.FPS),
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
@@ -173,7 +178,7 @@ func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource) (
 		)
 	}
 
-	args = append(args, videoArgs(set.Codec, withAudio, audioCh)...)
+	args = append(args, videoArgs(set.Codec, vendor, withAudio, audioCh)...)
 	if withAudio {
 		// No -shortest: when the encoder lags behind real time, frames are
 		// still queued at stop, and -shortest would cut the file at the
@@ -227,7 +232,7 @@ func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource) (
 		return nil, fmt.Errorf("%s: start ffmpeg: %w", name, err)
 	}
 	r.cmd = cmd
-	log.Printf("recording %s -> %s (%dx%d %s @%dfps, audio=%v)", name, file, w, h, set.Codec.ID, set.FPS, withAudio)
+	log.Printf("recording %s -> %s (%dx%d %s/%s @%dfps, audio=%v)", name, file, w, h, set.Codec.ID, vendor.Label(), set.FPS, withAudio)
 
 	go r.videoLoop(stdin)
 	return r, nil

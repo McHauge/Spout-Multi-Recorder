@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/McHauge/Spout-Multi-Recorder/internal/hwstat"
 )
 
 // Codec is a user-selectable encoding preset.
@@ -75,67 +77,54 @@ func hasEncoder(name string) bool {
 	return encoderProbe[name]
 }
 
-// videoArgs returns the FFmpeg output arguments (video + audio codecs) for a
-// codec preset. Hardware encoders are picked in order NVENC > QSV > AMF.
-// audioCh is the input audio channel count; AAC (mp4) is limited to 8
-// channels, so higher counts are downmixed there (PCM in MOV keeps all).
-func videoArgs(c Codec, withAudio bool, audioCh int) []string {
-	var v []string
-	// MKV presets reuse the mp4 video encoder selection.
-	id := c.ID
+// baseID maps the MKV presets onto the mp4 video-encoder family so they reuse
+// the same encoder selection.
+func baseID(id string) string {
 	switch id {
 	case "h264_mkv":
-		id = "h264"
+		return "h264"
 	case "hevc_mkv":
-		id = "hevc"
+		return "hevc"
 	case "av1_mkv":
-		id = "av1"
+		return "av1"
 	}
-	switch id {
-	case "h264":
-		switch {
-		case hasEncoder("h264_nvenc"):
-			v = []string{"-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"}
-		case hasEncoder("h264_qsv"):
-			v = []string{"-c:v", "h264_qsv", "-global_quality", "21", "-pix_fmt", "nv12"}
-		case hasEncoder("h264_amf"):
-			v = []string{"-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "21", "-qp_p", "23", "-pix_fmt", "yuv420p"}
-		default:
-			v = []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"}
-		}
-	case "h264_sw":
-		v = []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"}
-	case "hevc":
-		switch {
-		case hasEncoder("hevc_nvenc"):
-			v = []string{"-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
-		case hasEncoder("hevc_qsv"):
-			v = []string{"-c:v", "hevc_qsv", "-global_quality", "23", "-pix_fmt", "nv12", "-tag:v", "hvc1"}
-		case hasEncoder("hevc_amf"):
-			v = []string{"-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "23", "-qp_p", "25", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
-		default:
-			v = []string{"-c:v", "libx265", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
-		}
-	case "av1":
-		switch {
-		case hasEncoder("av1_nvenc"):
-			v = []string{"-c:v", "av1_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "27", "-b:v", "0", "-pix_fmt", "yuv420p"}
-		case hasEncoder("av1_qsv"):
-			v = []string{"-c:v", "av1_qsv", "-global_quality", "27", "-pix_fmt", "nv12"}
-		case hasEncoder("av1_amf"):
-			v = []string{"-c:v", "av1_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "27", "-qp_p", "29", "-pix_fmt", "yuv420p"}
-		default:
-			v = []string{"-c:v", "libsvtav1", "-preset", "8", "-crf", "30", "-pix_fmt", "yuv420p"}
-		}
-	case "prores":
-		v = []string{"-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"}
-	case "dnxhr":
-		v = []string{"-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"}
-	case "mjpeg":
-		v = []string{"-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj422p"}
-	default:
-		v = []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"}
+	return id
+}
+
+// codecFamily returns "h264", "hevc" or "av1" for presets that have hardware
+// encoders, or "" for software-only presets (h264_sw, prores, dnxhr, mjpeg).
+func codecFamily(c Codec) string {
+	switch baseID(c.ID) {
+	case "h264", "hevc", "av1":
+		return baseID(c.ID)
 	}
+	return ""
+}
+
+// AvailableVendors reports which encoder backends can serve this codec. A
+// hardware vendor counts only when the ffmpeg build has its encoder *and* a
+// matching GPU is physically installed (an ffmpeg build can list e.g. QSV on a
+// machine with no Intel GPU). CPU is always available; software-only presets
+// return CPU alone. Used by the load balancer to decide where channels can go.
+func AvailableVendors(c Codec) map[hwstat.Vendor]bool {
+	av := map[hwstat.Vendor]bool{hwstat.VendorCPU: true}
+	fam := codecFamily(c)
+	if fam == "" {
+		return av
+	}
+	av[hwstat.VendorNVENC] = hasEncoder(fam+"_nvenc") && hwstat.PresentGPU(hwstat.VendorNVENC)
+	av[hwstat.VendorIntel] = hasEncoder(fam+"_qsv") && hwstat.PresentGPU(hwstat.VendorIntel)
+	av[hwstat.VendorAMD] = hasEncoder(fam+"_amf") && hwstat.PresentGPU(hwstat.VendorAMD)
+	return av
+}
+
+// videoArgs returns the FFmpeg output arguments (video + audio codecs) for a
+// codec preset, using the encoder backend chosen by the load balancer. If the
+// requested hardware encoder is unavailable it falls back to software.
+// audioCh is the input audio channel count; AAC (mp4) is limited to 8
+// channels, so higher counts are downmixed there (PCM in MOV keeps all).
+func videoArgs(c Codec, vendor hwstat.Vendor, withAudio bool, audioCh int) []string {
+	v := encoderArgs(c, vendor)
 
 	if withAudio {
 		switch c.Ext {
@@ -155,4 +144,92 @@ func videoArgs(c Codec, withAudio bool, audioCh int) []string {
 		}
 	}
 	return v
+}
+
+// swArgs returns the software encoder for a codec family.
+func swArgs(fam string) []string {
+	switch fam {
+	case "hevc":
+		return []string{"-c:v", "libx265", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+	case "av1":
+		return []string{"-c:v", "libsvtav1", "-preset", "8", "-crf", "30", "-pix_fmt", "yuv420p"}
+	default:
+		return []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"}
+	}
+}
+
+// encoderArgs returns the -c:v arguments for a preset using the requested
+// vendor. Non-hardware presets ignore vendor; hardware presets fall back to
+// software when the requested encoder isn't in this ffmpeg build.
+func encoderArgs(c Codec, vendor hwstat.Vendor) []string {
+	switch baseID(c.ID) {
+	case "h264":
+		return h264Args(vendor)
+	case "hevc":
+		return hevcArgs(vendor)
+	case "av1":
+		return av1Args(vendor)
+	case "prores":
+		return []string{"-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"}
+	case "dnxhr":
+		return []string{"-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"}
+	case "mjpeg":
+		return []string{"-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj422p"}
+	default: // h264_sw and anything unknown
+		return swArgs("h264")
+	}
+}
+
+func h264Args(vendor hwstat.Vendor) []string {
+	switch vendor {
+	case hwstat.VendorNVENC:
+		if hasEncoder("h264_nvenc") {
+			return []string{"-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"}
+		}
+	case hwstat.VendorIntel:
+		if hasEncoder("h264_qsv") {
+			return []string{"-c:v", "h264_qsv", "-global_quality", "21", "-pix_fmt", "nv12"}
+		}
+	case hwstat.VendorAMD:
+		if hasEncoder("h264_amf") {
+			return []string{"-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "21", "-qp_p", "23", "-pix_fmt", "yuv420p"}
+		}
+	}
+	return swArgs("h264")
+}
+
+func hevcArgs(vendor hwstat.Vendor) []string {
+	switch vendor {
+	case hwstat.VendorNVENC:
+		if hasEncoder("hevc_nvenc") {
+			return []string{"-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+		}
+	case hwstat.VendorIntel:
+		if hasEncoder("hevc_qsv") {
+			return []string{"-c:v", "hevc_qsv", "-global_quality", "23", "-pix_fmt", "nv12", "-tag:v", "hvc1"}
+		}
+	case hwstat.VendorAMD:
+		if hasEncoder("hevc_amf") {
+			return []string{"-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "23", "-qp_p", "25", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+		}
+	}
+	return swArgs("hevc")
+}
+
+func av1Args(vendor hwstat.Vendor) []string {
+	switch vendor {
+	case hwstat.VendorNVENC:
+		if hasEncoder("av1_nvenc") {
+			return []string{"-c:v", "av1_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "27", "-b:v", "0", "-pix_fmt", "yuv420p"}
+		}
+	case hwstat.VendorIntel:
+		if hasEncoder("av1_qsv") {
+			return []string{"-c:v", "av1_qsv", "-global_quality", "27", "-pix_fmt", "nv12"}
+		}
+	case hwstat.VendorAMD:
+		if hasEncoder("av1_amf") {
+			return []string{"-c:v", "av1_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "27", "-qp_p", "29", "-pix_fmt", "yuv420p"}
+		}
+	}
+	return swArgs("av1")
 }

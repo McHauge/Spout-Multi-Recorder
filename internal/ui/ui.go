@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -26,6 +27,7 @@ import (
 	"github.com/McHauge/Spout-Multi-Recorder/internal/assets"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/audio"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/engine"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/hwstat"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
 )
@@ -48,7 +50,13 @@ type Config struct {
 	// ResolveProject writes .drp, .xml and .fcpxml project files next to
 	// the recordings for direct import into DaVinci Resolve.
 	ResolveProject bool     `json:"resolve_project"`
-	NDISources     []string `json:"ndi_sources"`
+	// FillWeight is the load fraction (0..1) an encoder is filled to before
+	// channels spill to the next one (default 0.80).
+	FillWeight float64 `json:"fill_weight"`
+	// CostBaseline is the estimated encoder load (%) of one 1080p30 channel
+	// used by the load balancer (default 18).
+	CostBaseline float64  `json:"cost_baseline"`
+	NDISources   []string `json:"ndi_sources"`
 	// Per-NDI-source master-audio preference (default false = native NDI audio).
 	NDIReplaceAudio map[string]bool `json:"ndi_replace_audio,omitempty"`
 }
@@ -66,7 +74,8 @@ func configPath() string {
 // LoadConfig reads the saved configuration (with defaults).
 func LoadConfig() Config {
 	cfg := Config{Codec: "h264", FPS: 30, MaxChannels: 8,
-		SessionFolders: true, Timecode: true, ResolveProject: true}
+		SessionFolders: true, Timecode: true, ResolveProject: true,
+		FillWeight: 0.80, CostBaseline: 18}
 	home, _ := os.UserHomeDir()
 	cfg.OutDir = filepath.Join(home, "Videos", "SpoutRecordings")
 	if b, err := os.ReadFile(configPath()); err == nil {
@@ -77,6 +86,12 @@ func LoadConfig() Config {
 	}
 	if cfg.MaxChannels <= 0 {
 		cfg.MaxChannels = 8
+	}
+	if cfg.FillWeight <= 0 || cfg.FillWeight > 1 {
+		cfg.FillWeight = 0.80
+	}
+	if cfg.CostBaseline <= 0 {
+		cfg.CostBaseline = 18
 	}
 	return cfg
 }
@@ -100,8 +115,10 @@ type App struct {
 
 	vu        *VUMeter
 	recordBtn *widget.Button
-	elapsed   *widget.Label
-	statusBar *widget.Label
+	elapsed      *widget.Label
+	statusBar    *widget.Label
+	hwUsage      *widget.Label // live per-vendor encode utilization footer
+	ffmpegStatus *pathStatus   // compact ffmpeg loaded/missing indicator
 	grid      *fyne.Container
 	scroll    *container.Scroll
 	emptyBox  fyne.CanvasObject
@@ -110,6 +127,7 @@ type App struct {
 	codecSel   *widget.Select
 	fpsSel     *widget.Select
 	maxChSel   *widget.Select
+	fillSel    *widget.Select
 	autoChk    *widget.Check
 	sessionChk *widget.Check
 	tcChk      *widget.Check
@@ -150,6 +168,7 @@ func Run(eng *engine.Engine, aud *audio.Engine, version string) {
 	a.fapp.SetIcon(assets.Icon)
 	eng.SetMaxChannels(a.cfg.MaxChannels)
 	eng.SetAutoRecord(a.cfg.AutoRecord)
+	eng.SetBalance(a.cfg.FillWeight, a.cfg.CostBaseline)
 	for _, n := range a.cfg.NDISources {
 		eng.AddNDI(n, a.cfg.NDIReplaceAudio[n])
 	}
@@ -245,6 +264,16 @@ func (a *App) buildUI() {
 	})
 	a.maxChSel.SetSelected(strconv.Itoa(a.cfg.MaxChannels))
 
+	// --- encoder load balancing
+	a.fillSel = widget.NewSelect([]string{"50%", "60%", "70%", "80%", "90%", "95%"}, func(s string) {
+		if pct, err := strconv.Atoi(strings.TrimSuffix(s, "%")); err == nil {
+			a.cfg.FillWeight = float64(pct) / 100
+			a.eng.SetBalance(a.cfg.FillWeight, a.cfg.CostBaseline)
+			a.cfg.save()
+		}
+	})
+	a.fillSel.SetSelected(fmt.Sprintf("%d%%", int(a.cfg.FillWeight*100+0.5)))
+
 	a.autoChk = widget.NewCheck("Auto-record new Spout senders", func(v bool) {
 		a.cfg.AutoRecord = v
 		a.eng.SetAutoRecord(v)
@@ -285,13 +314,20 @@ func (a *App) buildUI() {
 	// --- VU meter
 	a.vu = NewVUMeter()
 
-	// --- status bar
+	// --- encoder usage footer
+	a.hwUsage = widget.NewLabel("")
+	a.hwUsage.SetText(a.hwUsageText())
+
+	// --- status bar (transient messages; empty at rest)
 	a.statusBar = widget.NewLabel("")
 	a.statusBar.Truncation = fyne.TextTruncateEllipsis
+
+	// --- compact ffmpeg indicator (path on hover, click to copy)
+	a.ffmpegStatus = newPathStatus(a.fapp.Clipboard())
 	if a.ffmpegErr != nil {
-		a.statusBar.SetText("⚠ " + a.ffmpegErr.Error())
+		a.ffmpegStatus.set("⚠ ffmpeg missing", a.ffmpegErr.Error())
 	} else {
-		a.statusBar.SetText("FFmpeg: " + a.ffmpegPath)
+		a.ffmpegStatus.set("ffmpeg loaded", a.ffmpegPath)
 	}
 
 	// --- layout
@@ -310,7 +346,9 @@ func (a *App) buildUI() {
 		addNDIBtn,
 	)
 	row3 := container.NewBorder(nil, nil, widget.NewLabel("Save to:"), a.browseBtn, a.outEntry)
-	row4 := container.NewHBox(a.sessionChk, a.tcChk, a.resolveChk, layout.NewSpacer())
+	row4 := container.NewHBox(a.sessionChk, a.tcChk, a.resolveChk, layout.NewSpacer(),
+		widget.NewLabel("Fill encoder to:"), a.fillSel,
+	)
 
 	a.grid = container.NewGridWrap(fyne.NewSize(324, 300))
 	a.scroll = container.NewVScroll(a.grid)
@@ -326,7 +364,8 @@ func (a *App) buildUI() {
 		verText = "v" + verText
 	}
 	verLbl := widget.NewLabel(verText)
-	bottom := container.NewBorder(nil, nil, nil, verLbl, a.statusBar)
+	rightFooter := container.NewHBox(a.ffmpegStatus, verLbl)
+	bottom := container.NewBorder(nil, nil, a.hwUsage, rightFooter, a.statusBar)
 	content := container.NewBorder(top, bottom, nil, nil, body)
 	a.win.SetContent(content)
 }
@@ -665,6 +704,7 @@ func (a *App) startTickers() {
 					card.status.SetText(a.cardStatus(card))
 					card.audioInfo.SetText(a.cardAudioInfo(card))
 				}
+				a.hwUsage.SetText(a.hwUsageText())
 				if recording {
 					d := time.Since(a.recStart).Round(time.Second)
 					a.elapsed.SetText(fmt.Sprintf("● %s", d))
@@ -686,6 +726,23 @@ func (a *App) snapshotCards() []*channelCard {
 	return out
 }
 
+// hwUsageText renders the footer line, e.g. "NVENC 62% · AMD 18% · CPU 24%".
+// Only encoders that are actually usable (ffmpeg support + matching GPU) are
+// listed; absent ones are omitted entirely. CPU is always shown. Values blend
+// real measured utilization with the estimated load of the running channels.
+func (a *App) hwUsageText() string {
+	load := a.eng.HWLoad()
+	avail := recorder.AvailableVendors(recorder.CodecByID(a.cfg.Codec))
+	order := []hwstat.Vendor{hwstat.VendorNVENC, hwstat.VendorAMD, hwstat.VendorIntel, hwstat.VendorCPU}
+	parts := make([]string, 0, len(order))
+	for _, v := range order {
+		if v == hwstat.VendorCPU || avail[v] {
+			parts = append(parts, fmt.Sprintf("%s %.0f%%", v.Label(), load.Of(v)))
+		}
+	}
+	return "Encoders  " + strings.Join(parts, " · ")
+}
+
 func (a *App) cardStatus(card *channelCard) string {
 	rec := card.ch.Recorder()
 	w, h, _, _ := card.ch.Buf.Dims()
@@ -694,12 +751,13 @@ func (a *App) cardStatus(card *channelCard) string {
 	case rec != nil && rec.Err() != nil:
 		return "⚠ error"
 	case rec != nil && !online:
-		return fmt.Sprintf("🔴 REC (black) %d f", rec.Frames())
+		return fmt.Sprintf("🔴 REC (black) %d f · %s", rec.Frames(), rec.Info().Vendor.Label())
 	case rec != nil:
+		enc := rec.Info().Vendor.Label()
 		if b := rec.Behind(); b > 2*int64(a.cfg.FPS) {
-			return fmt.Sprintf("🔴 REC %d f ⚠ %ds behind", rec.Frames(), b/int64(a.cfg.FPS))
+			return fmt.Sprintf("🔴 REC %d f · %s ⚠ %ds behind", rec.Frames(), enc, b/int64(a.cfg.FPS))
 		}
-		return fmt.Sprintf("🔴 REC %d f", rec.Frames())
+		return fmt.Sprintf("🔴 REC %d f · %s", rec.Frames(), enc)
 	case online:
 		return fmt.Sprintf("🟢 %d×%d", w, h)
 	case w > 0:
@@ -710,8 +768,8 @@ func (a *App) cardStatus(card *channelCard) string {
 }
 
 func (a *App) setControlsEnabled(enabled bool) {
-	ws := []fyne.Disableable{a.audioSel, a.codecSel, a.fpsSel, a.maxChSel, a.outEntry, a.browseBtn,
-		a.sessionChk, a.tcChk, a.resolveChk}
+	ws := []fyne.Disableable{a.audioSel, a.codecSel, a.fpsSel, a.maxChSel, a.fillSel,
+		a.outEntry, a.browseBtn, a.sessionChk, a.tcChk, a.resolveChk}
 	for _, w := range ws {
 		if enabled {
 			w.Enable()

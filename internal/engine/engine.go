@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/McHauge/Spout-Multi-Recorder/internal/frame"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/hwstat"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/resolve"
@@ -209,6 +210,9 @@ type Engine struct {
 	sessionName string // timestamp name of the current/last session
 	stop        chan struct{}
 
+	sampler    *hwstat.Sampler      // live per-vendor encode utilization
+	balanceCfg recorder.BalanceCfg  // how channels are spread across encoders
+
 	// OnChange is called (from the discovery goroutine) whenever the channel
 	// list changes. The UI wraps this with fyne.Do.
 	OnChange func()
@@ -220,7 +224,10 @@ func New(maxChannels int) *Engine {
 		channels:    map[string]*Channel{},
 		maxChannels: maxChannels,
 		stop:        make(chan struct{}),
+		sampler:     hwstat.New(),
+		balanceCfg:  recorder.DefaultBalanceCfg(),
 	}
+	e.sampler.Start()
 	go e.discoveryLoop()
 	return e
 }
@@ -232,6 +239,20 @@ func (e *Engine) SetMaxChannels(n int) {
 	e.mu.Unlock()
 }
 
+// SetBalance updates the load-balancer tuning: fillWeight is the load fraction
+// (0..1) an encoder is filled to before spilling, and costBaseline is the
+// estimated load (%) of one 1080p30 channel. Applies to the next assignment.
+func (e *Engine) SetBalance(fillWeight, costBaseline float64) {
+	e.mu.Lock()
+	if fillWeight > 0 && fillWeight <= 1 {
+		e.balanceCfg.FillWeight = fillWeight
+	}
+	if costBaseline > 0 {
+		e.balanceCfg.CostBaseline = costBaseline
+	}
+	e.mu.Unlock()
+}
+
 // SetAutoRecord controls whether senders that appear (or deliver their first
 // frame) during a recording session automatically get their own recorder.
 func (e *Engine) SetAutoRecord(v bool) {
@@ -240,12 +261,74 @@ func (e *Engine) SetAutoRecord(v bool) {
 	e.mu.Unlock()
 }
 
+// samplerLoad returns the latest real measured encode utilization (zero if the
+// sampler isn't running).
+func (e *Engine) samplerLoad() hwstat.Load {
+	if e.sampler == nil {
+		return hwstat.Load{}
+	}
+	return e.sampler.Load()
+}
+
+// estimatedActiveLoadLocked sums the estimated per-vendor encode cost of the
+// recorders currently running. Caller must hold e.mu.
+func (e *Engine) estimatedActiveLoadLocked() hwstat.Load {
+	est := map[hwstat.Vendor]float64{}
+	for _, c := range e.channels {
+		c.mu.Lock()
+		rec := c.rec
+		c.mu.Unlock()
+		if rec == nil {
+			continue
+		}
+		info := rec.Info()
+		est[info.Vendor] += e.balanceCfg.EstimatedCost(info.W, info.H, info.FPS)
+	}
+	return hwstat.Load{
+		NVENC: est[hwstat.VendorNVENC],
+		AMD:   est[hwstat.VendorAMD],
+		Intel: est[hwstat.VendorIntel],
+		CPU:   est[hwstat.VendorCPU],
+	}
+}
+
+// blendedLoadLocked blends real measured utilization with the estimated load of
+// active recorders (per vendor, whichever is higher), so the reading reflects a
+// just-started encoder immediately and tracks real load as it climbs. Caller
+// must hold e.mu.
+func (e *Engine) blendedLoadLocked() hwstat.Load {
+	real := e.samplerLoad()
+	est := e.estimatedActiveLoadLocked()
+	maxf := func(a, b float64) float64 {
+		if a > b {
+			return a
+		}
+		return b
+	}
+	return hwstat.Load{
+		NVENC: maxf(real.NVENC, est.NVENC),
+		AMD:   maxf(real.AMD, est.AMD),
+		Intel: maxf(real.Intel, est.Intel),
+		CPU:   maxf(real.CPU, est.CPU),
+	}
+}
+
+// HWLoad returns the blended per-vendor encode utilization for the UI footer.
+func (e *Engine) HWLoad() hwstat.Load {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.blendedLoadLocked()
+}
+
 // Close stops discovery, capture loops and any recording. The wait for the
 // capture goroutines is bounded: an NDI receiver teardown can block inside
 // the runtime (NDIlib_recv_destroy), and shutdown must not hang on it.
 func (e *Engine) Close() {
 	close(e.stop)
 	e.StopRecording()
+	if e.sampler != nil {
+		e.sampler.Stop()
+	}
 	e.mu.Lock()
 	chans := make([]*Channel, 0, len(e.channels))
 	for _, c := range e.channels {
@@ -357,7 +440,11 @@ func (e *Engine) discoveryLoop() {
 				if w == 0 || h == 0 {
 					continue
 				}
-				rec, err := recorder.Start(c.Name, c.Buf, e.recSet, e.audioSourceFor(c, e.recSet))
+				// Assign one channel against the current blended load so late
+				// joiners spill off already-busy encoders instead of piling on.
+				plan := []recorder.PlanInput{{Channel: c.Name, W: w, H: h, FPS: e.recSet.FPS}}
+				assign := recorder.Assign(plan, recorder.AvailableVendors(e.recSet.Codec), e.blendedLoadLocked(), e.balanceCfg)
+				rec, err := recorder.Start(c.Name, c.Buf, e.recSet, e.audioSourceFor(c, e.recSet), assign[c.Name])
 				if err != nil {
 					log.Printf("auto-record %s: %v", n, err)
 					continue
@@ -477,6 +564,24 @@ func (e *Engine) StartRecording(set recorder.Settings) (int, error) {
 		e.sessionDir = dir
 	}
 	e.recSet = set
+
+	// Plan which encoder each channel lands on before spawning any FFmpeg, so
+	// the load is spread NVENC → AMD → Intel → CPU and stays fixed for the
+	// session. Only armed channels with frames are recordable.
+	var plan []recorder.PlanInput
+	for _, n := range e.order {
+		c := e.channels[n]
+		if !c.Armed() {
+			continue
+		}
+		w, h, _, _ := c.Buf.Dims()
+		if w == 0 || h == 0 {
+			continue
+		}
+		plan = append(plan, recorder.PlanInput{Channel: c.Name, W: w, H: h, FPS: set.FPS})
+	}
+	assign := recorder.Assign(plan, recorder.AvailableVendors(set.Codec), e.samplerLoad(), e.balanceCfg)
+
 	started := 0
 	var firstErr error
 	for _, n := range e.order {
@@ -489,7 +594,7 @@ func (e *Engine) StartRecording(set recorder.Settings) (int, error) {
 			log.Printf("skipping %s: no frame received yet", n)
 			continue
 		}
-		rec, err := recorder.Start(c.Name, c.Buf, set, e.audioSourceFor(c, set))
+		rec, err := recorder.Start(c.Name, c.Buf, set, e.audioSourceFor(c, set), assign[c.Name])
 		if err != nil {
 			log.Printf("start %s: %v", n, err)
 			if firstErr == nil {
