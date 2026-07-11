@@ -9,9 +9,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/sys/windows"
 
@@ -26,8 +28,10 @@ import (
 
 	"github.com/McHauge/Spout-Multi-Recorder/internal/assets"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/audio"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/decklink"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/engine"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/hwstat"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/mfcap"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
 )
@@ -61,6 +65,44 @@ type Config struct {
 	NDISources   []string `json:"ndi_sources"`
 	// Per-NDI-source master-audio preference (default false = native NDI audio).
 	NDIReplaceAudio map[string]bool `json:"ndi_replace_audio,omitempty"`
+
+	// WebcamSources are manually added UVC/Media Foundation cameras.
+	WebcamSources []WebcamSource `json:"webcam_sources,omitempty"`
+	// Per-webcam master-audio preference, keyed by display name (default false
+	// = the webcam's own microphone).
+	CamReplaceAudio map[string]bool `json:"cam_replace_audio,omitempty"`
+
+	// DeckLinkSources are manually added Blackmagic DeckLink inputs (by device
+	// display name).
+	DeckLinkSources []string `json:"decklink_sources,omitempty"`
+	// Per-DeckLink master-audio preference (default false = native SDI audio).
+	DLReplaceAudio map[string]bool `json:"dl_replace_audio,omitempty"`
+}
+
+// WebcamSource is a persisted webcam: the stable device symbolic link (used to
+// reopen it), a friendly display name, and the WASAPI endpoint to capture
+// alongside the video ("" = no native audio; AudioLoopback marks a speaker
+// loopback source).
+type WebcamSource struct {
+	Name          string `json:"name"`
+	Link          string `json:"link"`
+	Audio         string `json:"audio,omitempty"`
+	AudioLoopback bool   `json:"audio_loopback,omitempty"`
+	// Desired video mode; all zero = auto (highest resolution at the recording
+	// frame rate).
+	Width    int `json:"width,omitempty"`
+	Height   int `json:"height,omitempty"`
+	FPSx1000 int `json:"fps_x1000,omitempty"`
+}
+
+// mode returns the webcam's desired capture mode. A saved explicit mode is used
+// as-is; otherwise "auto" targets the current recording frame rate so the
+// highest resolution that can sustain it is chosen.
+func (a *App) webcamMode(w WebcamSource) mfcap.Mode {
+	if w.Width > 0 && w.Height > 0 {
+		return mfcap.Mode{W: w.Width, H: w.Height, FPSx1000: w.FPSx1000}
+	}
+	return mfcap.Mode{FPSx1000: a.cfg.FPS * 1000}
 }
 
 func configPath() string {
@@ -121,9 +163,9 @@ type App struct {
 	vu           *VUMeter
 	recordBtn    *widget.Button
 	elapsed      *widget.RichText // "● 0:08" with a red recording dot
-	statusBar    *pathStatus   // transient messages; click-to-copy saved path
-	hwUsage      *widget.Label // live per-vendor encode utilization footer
-	ffmpegStatus *pathStatus   // compact ffmpeg loaded/missing indicator
+	statusBar    *pathStatus      // transient messages; click-to-copy saved path
+	hwUsage      *widget.Label    // live per-vendor encode utilization footer
+	ffmpegStatus *pathStatus      // compact ffmpeg loaded/missing indicator
 	grid         *fyne.Container
 	scroll       *container.Scroll
 	emptyBox     fyne.CanvasObject
@@ -177,6 +219,12 @@ func Run(eng *engine.Engine, aud *audio.Engine, version string) {
 	eng.SetBalance(a.cfg.FillWeight, a.cfg.CostBaseline)
 	for _, n := range a.cfg.NDISources {
 		eng.AddNDI(n, a.cfg.NDIReplaceAudio[n])
+	}
+	for _, w := range a.cfg.WebcamSources {
+		eng.AddWebcam(w.Name, w.Link, w.Audio, w.AudioLoopback, a.webcamMode(w), a.cfg.CamReplaceAudio[w.Name])
+	}
+	for _, n := range a.cfg.DeckLinkSources {
+		eng.AddDeckLink(n, a.cfg.DLReplaceAudio[n])
 	}
 	a.ffmpegPath, a.ffmpegErr = recorder.FindFFmpeg()
 	if a.ffmpegErr == nil {
@@ -368,8 +416,10 @@ func (a *App) buildUI() {
 		a.vu,
 	))
 	addNDIBtn := widget.NewButtonWithIcon("Add NDI", theme.ContentAddIcon(), a.addNDISource)
+	addCamBtn := widget.NewButtonWithIcon("Add Webcam", theme.ContentAddIcon(), a.addWebcamSource)
+	addDLBtn := widget.NewButtonWithIcon("Add DeckLink", theme.ContentAddIcon(), a.addDeckLinkSource)
 	row1 := container.NewHBox(
-		a.recordBtn, addNDIBtn,
+		a.recordBtn, addNDIBtn, addCamBtn, addDLBtn,
 		layout.NewSpacer(),
 		a.elapsed,
 		vuWrap,
@@ -393,7 +443,7 @@ func (a *App) buildUI() {
 
 	a.grid = container.NewGridWrap(fyne.NewSize(324, 300))
 	a.scroll = container.NewVScroll(a.grid)
-	emptyLbl := widget.NewLabel("Waiting for Spout senders…\nStart any Spout-enabled app and it will appear here.")
+	emptyLbl := widget.NewLabel("Waiting for Spout senders…\nStart any Spout-enabled app and it will appear here,\nor use Add NDI / Add Webcam / Add DeckLink above.")
 	emptyLbl.Alignment = fyne.TextAlignCenter
 	a.emptyBox = container.NewCenter(emptyLbl)
 	a.rebuildGrid()
@@ -488,16 +538,11 @@ func (a *App) newCard(ch *engine.Channel) *channelCard {
 	check.SetChecked(ch.Armed())
 
 	// "master audio": mux the master device into this channel's file. When
-	// off, NDI channels record their native audio; Spout channels get none.
+	// off, manual sources record their native audio (NDI/SDI embedded, or the
+	// webcam mic); Spout channels get none.
 	audioChk := widget.NewCheck("master audio", func(v bool) {
 		ch.SetReplaceAudio(v)
-		if ch.NDI {
-			if a.cfg.NDIReplaceAudio == nil {
-				a.cfg.NDIReplaceAudio = map[string]bool{}
-			}
-			a.cfg.NDIReplaceAudio[ch.DisplayName()] = v
-			a.cfg.save()
-		}
+		a.saveReplaceAudioPref(ch, v)
 	})
 	audioChk.SetChecked(ch.ReplaceAudio())
 
@@ -509,15 +554,20 @@ func (a *App) newCard(ch *engine.Channel) *channelCard {
 	status := widget.NewLabel("⚫ waiting")
 
 	title := ch.DisplayName()
-	if ch.NDI {
+	switch ch.Kind {
+	case engine.KindNDI:
 		title = "NDI • " + title
+	case engine.KindWebcam:
+		title = "Cam • " + title
+	case engine.KindDeckLink:
+		title = "DeckLink • " + title
 	}
 	name := widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	name.Truncation = fyne.TextTruncateEllipsis
 
 	var header fyne.CanvasObject = name
-	if ch.NDI {
-		rm := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() { a.removeNDISource(ch) })
+	if ch.Manual() {
+		rm := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() { a.removeManualSource(ch) })
 		header = container.NewBorder(nil, nil, nil, rm, name)
 	}
 
@@ -543,7 +593,7 @@ func (a *App) cardAudioInfo(card *channelCard) string {
 			return "no audio"
 		}
 		ch = 2
-	case card.ch.NDI:
+	case card.ch.Manual():
 		ch = card.ch.NativeAudioChannels()
 		if ch <= 0 {
 			ch = 2
@@ -579,7 +629,7 @@ func (a *App) addNDISource() {
 			// Filter out sources that are already added.
 			existing := map[string]bool{}
 			for _, ch := range a.eng.Channels() {
-				if ch.NDI {
+				if ch.Kind == engine.KindNDI {
 					existing[ch.DisplayName()] = true
 				}
 			}
@@ -626,21 +676,318 @@ func (a *App) addNDISource() {
 	}()
 }
 
-// removeNDISource removes an NDI channel and forgets it in the config.
-func (a *App) removeNDISource(ch *engine.Channel) {
+const micNone = "No native audio"
+
+// addWebcamSource lists connected webcams and lets the user pick one plus an
+// optional microphone endpoint to record alongside it.
+func (a *App) addWebcamSource() {
+	if err := mfcap.Available(); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	devs, err := mfcap.Devices()
+	if err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	existing := map[string]bool{}
+	for _, w := range a.cfg.WebcamSources {
+		existing[w.Link] = true
+	}
+	var avail []mfcap.Device
+	for _, d := range devs {
+		if !existing[d.Link] {
+			avail = append(avail, d)
+		}
+	}
+	if len(avail) == 0 {
+		dialog.ShowInformation("Add webcam", "No (new) webcams found.", a.win)
+		return
+	}
+
+	// Microphone options: all audio endpoints with the same 🎤/🔊 labels as the
+	// master-audio selector. Labels map back to the Device on confirm.
+	a.refreshDevices()
+	micOpts := []string{micNone}
+	micByLabel := map[string]audio.Device{}
+	for _, d := range a.devices {
+		micOpts = append(micOpts, d.Label())
+		micByLabel[d.Label()] = d
+	}
+	micSel := widget.NewSelect(micOpts, nil)
+	micSel.SetSelected(micNone)
+
+	// Resolution/framerate: "Auto" (highest resolution reaching the recording
+	// FPS) plus the device's explicit modes, loaded when a webcam is selected.
+	autoLabel := fmt.Sprintf("Auto — highest resolution at %d fps", a.cfg.FPS)
+	resSel := widget.NewSelect([]string{autoLabel}, nil)
+	resSel.SetSelected(autoLabel)
+	modeByLabel := map[string]mfcap.Mode{}
+
+	names := make([]string, len(avail))
+	for i, d := range avail {
+		names[i] = d.Name
+	}
+	selected := -1
+	list := widget.NewList(
+		func() int { return len(names) },
+		func() fyne.CanvasObject { return widget.NewLabel("webcam name placeholder") },
+		func(i widget.ListItemID, o fyne.CanvasObject) { o.(*widget.Label).SetText(names[i]) },
+	)
+	list.OnSelected = func(id widget.ListItemID) {
+		selected = id
+		micSel.SetSelected(bestMic(avail[id].Name, micOpts)) // preselect matching mic
+		// Load this device's modes asynchronously (opening it briefly).
+		link := avail[id].Link
+		resSel.SetOptions([]string{autoLabel})
+		resSel.SetSelected(autoLabel)
+		go func() {
+			modes, err := mfcap.Modes(link)
+			fyne.Do(func() {
+				if selected != id {
+					return // user moved on to another webcam
+				}
+				opts := []string{autoLabel}
+				fresh := map[string]mfcap.Mode{}
+				for _, m := range sortModes(modes) {
+					lbl := modeLabel(m)
+					opts = append(opts, lbl)
+					fresh[lbl] = m
+				}
+				modeByLabel = fresh
+				resSel.SetOptions(opts)
+				resSel.SetSelected(autoLabel)
+				if err != nil {
+					log.Printf("webcam modes for %q: %v", link, err)
+				}
+			})
+		}()
+	}
+
+	micRow := container.NewBorder(nil, nil, widget.NewLabel("Microphone:"), nil, micSel)
+	resRow := container.NewBorder(nil, nil, widget.NewLabel("Resolution:"), nil, resSel)
+	content := container.NewBorder(nil, container.NewVBox(resRow, micRow), nil, nil,
+		container.NewVScroll(list))
+	d := dialog.NewCustomConfirm("Add webcam", "Add", "Cancel", content, func(ok bool) {
+		if !ok || selected < 0 {
+			return
+		}
+		dev := avail[selected]
+		micDev, hasMic := micByLabel[micSel.Selected]
+		replace := !hasMic // no endpoint chosen → default to the master audio device
+		name := a.uniqueWebcamName(dev.Name)
+
+		ws := WebcamSource{Name: name, Link: dev.Link, Audio: micDev.Name, AudioLoopback: micDev.Loopback}
+		mode := mfcap.Mode{FPSx1000: a.cfg.FPS * 1000} // auto default
+		if m, ok := modeByLabel[resSel.Selected]; ok {
+			mode = m
+			ws.Width, ws.Height, ws.FPSx1000 = m.W, m.H, m.FPSx1000
+		}
+
+		a.eng.AddWebcam(name, dev.Link, micDev.Name, micDev.Loopback, mode, replace)
+		a.cfg.WebcamSources = append(a.cfg.WebcamSources, ws)
+		if a.cfg.CamReplaceAudio == nil {
+			a.cfg.CamReplaceAudio = map[string]bool{}
+		}
+		a.cfg.CamReplaceAudio[name] = replace
+		a.cfg.save()
+	}, a.win)
+	d.Resize(fyne.NewSize(520, 460))
+	d.Show()
+}
+
+// modeLabel formats a webcam mode like "1920×1080 @ 30 fps".
+func modeLabel(m mfcap.Mode) string {
+	fps := "?"
+	if m.FPSx1000 > 0 {
+		if m.FPSx1000%1000 == 0 {
+			fps = strconv.Itoa(m.FPSx1000 / 1000)
+		} else {
+			fps = fmt.Sprintf("%.2f", m.FPS())
+		}
+	}
+	return fmt.Sprintf("%d×%d @ %s fps", m.W, m.H, fps)
+}
+
+// sortModes orders modes largest-resolution first, then highest fps.
+func sortModes(modes []mfcap.Mode) []mfcap.Mode {
+	out := make([]mfcap.Mode, len(modes))
+	copy(out, modes)
+	sort.Slice(out, func(i, j int) bool {
+		ai, aj := out[i].W*out[i].H, out[j].W*out[j].H
+		if ai != aj {
+			return ai > aj
+		}
+		return out[i].FPSx1000 > out[j].FPSx1000
+	})
+	return out
+}
+
+// uniqueWebcamName disambiguates identical webcam names (e.g. two of the same
+// model) so each maps to a distinct channel, appending " (2)", " (3)", …
+func (a *App) uniqueWebcamName(name string) string {
+	used := map[string]bool{}
+	for _, w := range a.cfg.WebcamSources {
+		used[w.Name] = true
+	}
+	if !used[name] {
+		return name
+	}
+	for i := 2; ; i++ {
+		cand := fmt.Sprintf("%s (%d)", name, i)
+		if !used[cand] {
+			return cand
+		}
+	}
+}
+
+// bestMic picks the microphone endpoint whose name best matches a webcam's
+// name (so "USB Webcam" preselects "Microphone (USB Webcam)"), or micNone.
+func bestMic(videoName string, micOpts []string) string {
+	best := micNone
+	bestScore := 0
+	vlow := strings.ToLower(videoName)
+	vtokens := wordTokens(vlow)
+	for _, m := range micOpts {
+		if m == micNone {
+			continue
+		}
+		mlow := strings.ToLower(m)
+		score := 0
+		if strings.Contains(mlow, vlow) {
+			score += 100
+		}
+		for _, t := range vtokens {
+			if len(t) >= 4 && strings.Contains(mlow, t) {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			best = m
+		}
+	}
+	return best
+}
+
+func wordTokens(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+}
+
+// addDeckLinkSource lists installed DeckLink inputs and lets the user add one.
+// Its embedded SDI audio is recorded by default (uncheck "master audio" per
+// card to keep it).
+func (a *App) addDeckLinkSource() {
+	if err := decklink.Available(); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	devs, err := decklink.Devices()
+	if err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+	existing := map[string]bool{}
+	for _, n := range a.cfg.DeckLinkSources {
+		existing[n] = true
+	}
+	var names []string
+	for _, n := range devs {
+		if !existing[n] {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		dialog.ShowInformation("Add DeckLink",
+			"No (new) DeckLink devices found.\nConnect a DeckLink card and try again.", a.win)
+		return
+	}
+
+	selected := -1
+	list := widget.NewList(
+		func() int { return len(names) },
+		func() fyne.CanvasObject { return widget.NewLabel("device name placeholder") },
+		func(i widget.ListItemID, o fyne.CanvasObject) { o.(*widget.Label).SetText(names[i]) },
+	)
+	list.OnSelected = func(id widget.ListItemID) { selected = id }
+	d := dialog.NewCustomConfirm("Add DeckLink", "Add", "Cancel",
+		container.NewVScroll(list), func(ok bool) {
+			if !ok || selected < 0 {
+				return
+			}
+			name := names[selected]
+			a.eng.AddDeckLink(name, a.cfg.DLReplaceAudio[name]) // default false = native SDI audio
+			a.cfg.DeckLinkSources = append(a.cfg.DeckLinkSources, name)
+			a.cfg.save()
+		}, a.win)
+	d.Resize(fyne.NewSize(520, 400))
+	d.Show()
+}
+
+// removeManualSource removes a user-added channel (NDI, webcam or DeckLink)
+// and forgets it in the config.
+func (a *App) removeManualSource(ch *engine.Channel) {
 	if err := a.eng.RemoveChannel(ch.Name); err != nil {
 		dialog.ShowError(err, a.win)
 		return
 	}
 	name := ch.DisplayName()
-	out := a.cfg.NDISources[:0]
-	for _, n := range a.cfg.NDISources {
-		if n != name {
+	switch ch.Kind {
+	case engine.KindNDI:
+		a.cfg.NDISources = removeString(a.cfg.NDISources, name)
+		delete(a.cfg.NDIReplaceAudio, name)
+	case engine.KindWebcam:
+		out := a.cfg.WebcamSources[:0]
+		for _, w := range a.cfg.WebcamSources {
+			if w.Name != name {
+				out = append(out, w)
+			}
+		}
+		a.cfg.WebcamSources = out
+		delete(a.cfg.CamReplaceAudio, name)
+	case engine.KindDeckLink:
+		a.cfg.DeckLinkSources = removeString(a.cfg.DeckLinkSources, name)
+		delete(a.cfg.DLReplaceAudio, name)
+	}
+	a.cfg.save()
+}
+
+// removeString returns in with the first occurrence of s removed.
+func removeString(in []string, s string) []string {
+	out := in[:0]
+	for _, n := range in {
+		if n != s {
 			out = append(out, n)
 		}
 	}
-	a.cfg.NDISources = out
-	delete(a.cfg.NDIReplaceAudio, name)
+	return out
+}
+
+// saveReplaceAudioPref persists the per-channel master-audio preference in the
+// config map appropriate to the channel's kind.
+func (a *App) saveReplaceAudioPref(ch *engine.Channel, v bool) {
+	name := ch.DisplayName()
+	switch ch.Kind {
+	case engine.KindNDI:
+		if a.cfg.NDIReplaceAudio == nil {
+			a.cfg.NDIReplaceAudio = map[string]bool{}
+		}
+		a.cfg.NDIReplaceAudio[name] = v
+	case engine.KindWebcam:
+		if a.cfg.CamReplaceAudio == nil {
+			a.cfg.CamReplaceAudio = map[string]bool{}
+		}
+		a.cfg.CamReplaceAudio[name] = v
+	case engine.KindDeckLink:
+		if a.cfg.DLReplaceAudio == nil {
+			a.cfg.DLReplaceAudio = map[string]bool{}
+		}
+		a.cfg.DLReplaceAudio[name] = v
+	default:
+		return // Spout: nothing to persist
+	}
 	a.cfg.save()
 }
 
@@ -665,7 +1012,7 @@ func (a *App) startTickers() {
 					if masterOn {
 						levels = []float64{l, r}
 					}
-				case card.ch.NDI:
+				case card.ch.Manual():
 					levels = card.ch.AudioLevels()
 				}
 				ups = append(ups, lv{card, levels})

@@ -55,7 +55,7 @@ func main() {
 	}
 
 	cfg := ui.LoadConfig()
-	eng := engine.New(cfg.MaxChannels)
+	eng := engine.New(cfg.MaxChannels, aud)
 
 	ui.Run(eng, aud, buildVersion())
 }

@@ -134,6 +134,75 @@ func (e *Engine) StartCapture(dev Device) error {
 	return nil
 }
 
+// AuxCapture is an independent WASAPI capture of one named endpoint (e.g. a
+// webcam's microphone), feeding PCM to a callback. It runs alongside — and
+// independently of — the master capture.
+type AuxCapture struct {
+	dev *malgo.Device
+}
+
+// OpenAux opens the device whose Name equals name (48kHz s16le stereo) and
+// calls onData for each buffer from the audio thread. When loopback is true the
+// named playback device is captured as loopback ("what you hear"). Close stops
+// it. The device is resolved by name each call, so IDs need not be stable.
+func (e *Engine) OpenAux(name string, loopback bool, onData func(pcm []byte, channels int)) (*AuxCapture, error) {
+	listType := malgo.Capture
+	if loopback {
+		listType = malgo.Playback
+	}
+	devs, err := e.ctx.Devices(listType)
+	if err != nil {
+		return nil, fmt.Errorf("audio: list devices: %w", err)
+	}
+	var id malgo.DeviceID
+	found := false
+	for _, d := range devs {
+		if d.Name() == name {
+			id = d.ID
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("audio: device %q not found", name)
+	}
+
+	devType := malgo.Capture
+	if loopback {
+		devType = malgo.Loopback
+	}
+	cfg := malgo.DefaultDeviceConfig(devType)
+	cfg.SampleRate = SampleRate
+	cfg.Capture.Format = malgo.FormatS16
+	cfg.Capture.Channels = Channels
+	// For loopback the capture device ID must be the playback device ID.
+	pid := id // copy: pointer must stay valid while the device runs
+	cfg.Capture.DeviceID = pid.Pointer()
+
+	onRecv := func(_, pInput []byte, _ uint32) {
+		chunk := make([]byte, len(pInput))
+		copy(chunk, pInput)
+		onData(chunk, Channels)
+	}
+	d, err := malgo.InitDevice(e.ctx.Context, cfg, malgo.DeviceCallbacks{Data: onRecv})
+	if err != nil {
+		return nil, fmt.Errorf("audio: init aux device %q: %w", name, err)
+	}
+	if err := d.Start(); err != nil {
+		d.Uninit()
+		return nil, fmt.Errorf("audio: start aux device %q: %w", name, err)
+	}
+	return &AuxCapture{dev: d}, nil
+}
+
+// Close stops and frees the aux capture.
+func (a *AuxCapture) Close() {
+	if a != nil && a.dev != nil {
+		a.dev.Uninit()
+		a.dev = nil
+	}
+}
+
 // StopCapture stops the master capture (subscribers stop receiving data).
 func (e *Engine) StopCapture() {
 	e.mu.Lock()

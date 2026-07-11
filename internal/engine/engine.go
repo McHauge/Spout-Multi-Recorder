@@ -13,27 +13,76 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/McHauge/Spout-Multi-Recorder/internal/audio"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/frame"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/hwstat"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/mfcap"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/resolve"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/spout"
 )
 
-// NDIPrefix namespaces manually added NDI channels in the channel map.
-const NDIPrefix = "ndi:"
+// Channel-name prefixes namespace manually added sources in the channel map.
+// Spout senders are keyed by their bare sender name (no prefix).
+const (
+	NDIPrefix      = "ndi:"
+	WebcamPrefix   = "cam:"
+	DeckLinkPrefix = "dl:"
+)
 
-// Channel is one Spout sender being monitored (and possibly recorded).
+var allPrefixes = []string{NDIPrefix, WebcamPrefix, DeckLinkPrefix}
+
+// stripPrefix removes any known source-kind prefix from a channel name.
+func stripPrefix(name string) string {
+	for _, p := range allPrefixes {
+		if strings.HasPrefix(name, p) {
+			return name[len(p):]
+		}
+	}
+	return name
+}
+
+// SourceKind identifies how a channel's frames are captured.
+type SourceKind int
+
+const (
+	KindSpout    SourceKind = iota // auto-discovered Spout sender (no prefix)
+	KindNDI                        // manually added NDI source
+	KindWebcam                     // manually added UVC/Media Foundation webcam
+	KindDeckLink                   // manually added Blackmagic DeckLink input
+)
+
+// String returns a human label used in logs.
+func (k SourceKind) String() string {
+	switch k {
+	case KindNDI:
+		return "NDI"
+	case KindWebcam:
+		return "webcam"
+	case KindDeckLink:
+		return "DeckLink"
+	default:
+		return "Spout"
+	}
+}
+
+// Channel is one video source being monitored (and possibly recorded).
 type Channel struct {
-	Name string // Spout sender name, or "ndi:<source name>" for NDI
-	NDI  bool
+	Name string // Spout sender name, or "<kind>:<source name>" for manual sources
+	Kind SourceKind
 	Buf  *frame.Buffer
+
+	eng           *Engine    // back-reference for manual sources (nil for Spout)
+	deviceID      string     // webcam symbolic link / DeckLink device name (reopen key)
+	audioDev      string     // webcam mic WASAPI endpoint name ("" = none)
+	audioLoopback bool       // webcam mic endpoint is a playback loopback source
+	camMode       mfcap.Mode // webcam desired mode (zero = auto)
 
 	armed        atomic.Bool
 	online       atomic.Bool
 	replaceAudio atomic.Bool  // record master device audio instead of source audio
-	pump         *audioPump   // native audio fanout (NDI channels only)
+	pump         *audioPump   // native audio fanout (manual sources only)
 	lastSeen     atomic.Int64 // unix nano of last time the sender name was listed
 
 	mu  sync.Mutex
@@ -42,6 +91,11 @@ type Channel struct {
 	stop chan struct{}
 	done chan struct{}
 }
+
+// Manual reports whether the channel was added by the user (NDI, webcam,
+// DeckLink) rather than auto-discovered from Spout. Manual channels are only
+// removed on the user's request and carry their own native audio pump.
+func (c *Channel) Manual() bool { return c.Kind != KindSpout }
 
 // Armed reports whether this channel will be included in recordings.
 func (c *Channel) Armed() bool { return c.armed.Load() }
@@ -53,11 +107,11 @@ func (c *Channel) SetArmed(v bool) { c.armed.Store(v) }
 // Online reports whether the sender currently exists.
 func (c *Channel) Online() bool { return c.online.Load() }
 
-// DisplayName is the channel name without the NDI namespace prefix.
-func (c *Channel) DisplayName() string { return strings.TrimPrefix(c.Name, NDIPrefix) }
+// DisplayName is the channel name without its source-kind namespace prefix.
+func (c *Channel) DisplayName() string { return stripPrefix(c.Name) }
 
 // NativeAudioChannels reports the channel count of the source's own audio
-// stream (NDI only; 0 when unknown or not an NDI channel).
+// stream (manual sources only; 0 when unknown or without native audio).
 func (c *Channel) NativeAudioChannels() int {
 	if c.pump == nil {
 		return 0
@@ -75,8 +129,8 @@ func (c *Channel) AudioLevels() []float64 {
 }
 
 // ReplaceAudio reports whether this channel records the master audio device.
-// When false, NDI channels record their native embedded audio instead and
-// Spout channels (which carry no audio) record without an audio track.
+// When false, manual sources record their own native audio (NDI/SDI embedded,
+// or the webcam mic) and Spout channels record without an audio track.
 func (c *Channel) ReplaceAudio() bool { return c.replaceAudio.Load() }
 
 // SetReplaceAudio changes the audio preference (affects the next recording).
@@ -212,20 +266,23 @@ type Engine struct {
 
 	sampler    *hwstat.Sampler     // live per-vendor encode utilization
 	balanceCfg recorder.BalanceCfg // how channels are spread across encoders
+	aud        *audio.Engine       // master audio; also opens per-webcam mics
 
 	// OnChange is called (from the discovery goroutine) whenever the channel
 	// list changes. The UI wraps this with fyne.Do.
 	OnChange func()
 }
 
-// New creates the engine and starts sender discovery.
-func New(maxChannels int) *Engine {
+// New creates the engine and starts sender discovery. aud may be nil; it is
+// used to open per-webcam microphone endpoints.
+func New(maxChannels int, aud *audio.Engine) *Engine {
 	e := &Engine{
 		channels:    map[string]*Channel{},
 		maxChannels: maxChannels,
 		stop:        make(chan struct{}),
 		sampler:     hwstat.New(),
 		balanceCfg:  recorder.DefaultBalanceCfg(),
+		aud:         aud,
 	}
 	e.sampler.Start()
 	go e.discoveryLoop()
@@ -358,7 +415,7 @@ func (e *Engine) discoveryLoop() {
 		// NDI channels are manual and only removed by the user.
 		if !e.recording {
 			for name, c := range e.channels {
-				if seen[name] || c.NDI {
+				if seen[name] || c.Manual() {
 					continue
 				}
 				if now-c.lastSeen.Load() > int64(5*time.Second) {
@@ -419,10 +476,10 @@ func (e *Engine) discoveryLoop() {
 	}
 }
 
-// AddNDI adds a manually selected NDI source as a channel (idempotent).
-// replaceAudio=false records the source's native NDI audio.
-func (e *Engine) AddNDI(sourceName string, replaceAudio bool) {
-	key := NDIPrefix + sourceName
+// addManual registers a user-added channel under key (idempotent), gives it a
+// native-audio pump, arms it and starts run as its capture goroutine. The
+// capture goroutine is responsible for starting c.pump.run(c.stop).
+func (e *Engine) addManual(key string, kind SourceKind, replaceAudio bool, setup func(*Channel), run func(*Channel)) {
 	e.mu.Lock()
 	if _, ok := e.channels[key]; ok {
 		e.mu.Unlock()
@@ -430,11 +487,15 @@ func (e *Engine) AddNDI(sourceName string, replaceAudio bool) {
 	}
 	c := &Channel{
 		Name: key,
-		NDI:  true,
+		Kind: kind,
 		Buf:  &frame.Buffer{},
+		eng:  e,
 		pump: newAudioPump(),
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
+	}
+	if setup != nil {
+		setup(c)
 	}
 	c.lastSeen.Store(time.Now().UnixNano())
 	c.SetArmed(true)
@@ -442,12 +503,41 @@ func (e *Engine) AddNDI(sourceName string, replaceAudio bool) {
 	e.channels[key] = c
 	e.order = append(e.order, key)
 	sort.Strings(e.order)
-	go c.captureNDI()
+	go run(c)
 	e.mu.Unlock()
-	log.Printf("added NDI source %q", sourceName)
+	log.Printf("added %s source %q", kind, stripPrefix(key))
 	if e.OnChange != nil {
 		e.OnChange()
 	}
+}
+
+// AddNDI adds a manually selected NDI source as a channel (idempotent).
+// replaceAudio=false records the source's native NDI audio.
+func (e *Engine) AddNDI(sourceName string, replaceAudio bool) {
+	e.addManual(NDIPrefix+sourceName, KindNDI, replaceAudio, nil, (*Channel).captureNDI)
+}
+
+// AddWebcam adds a UVC/Media Foundation webcam as a channel (idempotent). link
+// is the device symbolic link used to (re)open it; audioDev is the WASAPI
+// endpoint to capture alongside the video ("" = no native audio), and
+// audioLoopback marks it as a playback loopback source. mode is the desired
+// video mode (zero = auto: highest resolution reaching mode.FPSx1000, or the
+// best overall when that is also zero). replaceAudio=false records the endpoint.
+func (e *Engine) AddWebcam(name, link, audioDev string, audioLoopback bool, mode mfcap.Mode, replaceAudio bool) {
+	e.addManual(WebcamPrefix+name, KindWebcam, replaceAudio, func(c *Channel) {
+		c.deviceID = link
+		c.audioDev = audioDev
+		c.audioLoopback = audioLoopback
+		c.camMode = mode
+	}, (*Channel).captureWebcam)
+}
+
+// AddDeckLink adds a Blackmagic DeckLink input as a channel (idempotent), keyed
+// by device display name. replaceAudio=false records the embedded SDI audio.
+func (e *Engine) AddDeckLink(name string, replaceAudio bool) {
+	e.addManual(DeckLinkPrefix+name, KindDeckLink, replaceAudio, func(c *Channel) {
+		c.deviceID = name
+	}, (*Channel).captureDeckLink)
 }
 
 // RemoveChannel removes a (manually added) channel. It refuses while the
@@ -588,7 +678,7 @@ func (e *Engine) audioSourceFor(c *Channel, set recorder.Settings) recorder.Audi
 		}
 		return nil
 	}
-	if c.NDI && c.pump != nil {
+	if c.pump != nil {
 		return c.pump
 	}
 	return nil
@@ -638,7 +728,7 @@ func (e *Engine) StopRecording() {
 			continue // nothing usable was written
 		}
 		clips = append(clips, resolve.Clip{
-			Name:        strings.TrimPrefix(info.Name, NDIPrefix),
+			Name:        stripPrefix(info.Name),
 			Path:        info.File,
 			W:           info.W,
 			H:           info.H,
