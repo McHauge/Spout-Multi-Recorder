@@ -18,15 +18,25 @@ type pathStatus struct {
 	base     string // resting text
 	full     string // full path (revealed on hover, copied on click)
 	clip     fyne.Clipboard
+	align    fyne.TextAlign
+	truncate bool // ellipsis-clip long text (for width-constrained placements)
 	hovering bool
 	flashing bool // showing the transient "copied" confirmation
 }
 
 func newPathStatus(clip fyne.Clipboard) *pathStatus {
-	p := &pathStatus{clip: clip}
+	p := &pathStatus{clip: clip, align: fyne.TextAlignCenter}
 	p.ExtendBaseWidget(p)
 	return p
 }
+
+// setAlign overrides the label alignment. Call before the widget is rendered.
+func (p *pathStatus) setAlign(a fyne.TextAlign) { p.align = a }
+
+// setTruncate enables ellipsis clipping so long text doesn't force the window
+// wider. Only needed in width-constrained placements (e.g. a border centre).
+// Call before the widget is rendered.
+func (p *pathStatus) setTruncate(t bool) { p.truncate = t }
 
 // set updates the resting text and the full path revealed on hover/click.
 func (p *pathStatus) set(text, full string) {
@@ -36,7 +46,10 @@ func (p *pathStatus) set(text, full string) {
 
 func (p *pathStatus) CreateRenderer() fyne.WidgetRenderer {
 	p.label = widget.NewLabel(p.base)
-	p.label.Alignment = fyne.TextAlignCenter
+	p.label.Alignment = p.align
+	if p.truncate {
+		p.label.Truncation = fyne.TextTruncateEllipsis
+	}
 	return widget.NewSimpleRenderer(p.label)
 }
 

@@ -118,13 +118,107 @@ func AvailableVendors(c Codec) map[hwstat.Vendor]bool {
 	return av
 }
 
+// Speed is a user-selectable quality/throughput tier. It trades encoder effort
+// (and therefore engine load + compression) against speed, at a roughly
+// constant visual quality target (the cq/crf values are unchanged).
+type Speed struct {
+	ID    string
+	Label string
+}
+
+// Speeds available in the UI, in display order. "balanced" is the default and
+// matches the presets the app shipped with.
+var Speeds = []Speed{
+	{ID: "quality", Label: "Quality"},
+	{ID: "balanced", Label: "Balanced"},
+	{ID: "speed", Label: "Speed"},
+}
+
+// SpeedByID returns the tier with the given ID, defaulting to balanced.
+func SpeedByID(id string) Speed {
+	for _, s := range Speeds {
+		if s.ID == id {
+			return s
+		}
+	}
+	return Speeds[1]
+}
+
+// Per-encoder preset for a speed tier. Unknown/empty tier falls back to
+// balanced (the shipped defaults).
+func nvencPreset(speed string) string {
+	switch speed {
+	case "quality":
+		return "p6"
+	case "speed":
+		return "p3"
+	default:
+		return "p5"
+	}
+}
+
+func qsvPreset(speed string) string {
+	switch speed {
+	case "quality":
+		return "slower"
+	case "speed":
+		return "veryfast"
+	default:
+		return "medium"
+	}
+}
+
+func amfQuality(speed string) string {
+	switch speed {
+	case "quality":
+		return "quality"
+	case "speed":
+		return "speed"
+	default:
+		return "balanced"
+	}
+}
+
+func x264Preset(speed string) string {
+	switch speed {
+	case "quality":
+		return "medium"
+	case "speed":
+		return "superfast"
+	default:
+		return "veryfast"
+	}
+}
+
+func x265Preset(speed string) string {
+	switch speed {
+	case "quality":
+		return "medium"
+	case "speed":
+		return "superfast"
+	default:
+		return "fast"
+	}
+}
+
+func svtav1Preset(speed string) string {
+	switch speed { // libsvtav1: lower is slower/higher quality
+	case "quality":
+		return "6"
+	case "speed":
+		return "10"
+	default:
+		return "8"
+	}
+}
+
 // videoArgs returns the FFmpeg output arguments (video + audio codecs) for a
-// codec preset, using the encoder backend chosen by the load balancer. If the
-// requested hardware encoder is unavailable it falls back to software.
-// audioCh is the input audio channel count; AAC (mp4) is limited to 8
+// codec preset, using the encoder backend chosen by the load balancer and the
+// speed tier. If the requested hardware encoder is unavailable it falls back to
+// software. audioCh is the input audio channel count; AAC (mp4) is limited to 8
 // channels, so higher counts are downmixed there (PCM in MOV keeps all).
-func videoArgs(c Codec, vendor hwstat.Vendor, withAudio bool, audioCh int) []string {
-	v := encoderArgs(c, vendor)
+func videoArgs(c Codec, vendor hwstat.Vendor, speed string, withAudio bool, audioCh int) []string {
+	v := encoderArgs(c, vendor, speed)
 
 	if withAudio {
 		switch c.Ext {
@@ -146,29 +240,29 @@ func videoArgs(c Codec, vendor hwstat.Vendor, withAudio bool, audioCh int) []str
 	return v
 }
 
-// swArgs returns the software encoder for a codec family.
-func swArgs(fam string) []string {
+// swArgs returns the software encoder for a codec family at the given speed.
+func swArgs(fam, speed string) []string {
 	switch fam {
 	case "hevc":
-		return []string{"-c:v", "libx265", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+		return []string{"-c:v", "libx265", "-preset", x265Preset(speed), "-crf", "23", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
 	case "av1":
-		return []string{"-c:v", "libsvtav1", "-preset", "8", "-crf", "30", "-pix_fmt", "yuv420p"}
+		return []string{"-c:v", "libsvtav1", "-preset", svtav1Preset(speed), "-crf", "30", "-pix_fmt", "yuv420p"}
 	default:
-		return []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"}
+		return []string{"-c:v", "libx264", "-preset", x264Preset(speed), "-crf", "20", "-pix_fmt", "yuv420p"}
 	}
 }
 
 // encoderArgs returns the -c:v arguments for a preset using the requested
-// vendor. Non-hardware presets ignore vendor; hardware presets fall back to
-// software when the requested encoder isn't in this ffmpeg build.
-func encoderArgs(c Codec, vendor hwstat.Vendor) []string {
+// vendor and speed tier. Non-hardware presets ignore vendor; hardware presets
+// fall back to software when the requested encoder isn't in this ffmpeg build.
+func encoderArgs(c Codec, vendor hwstat.Vendor, speed string) []string {
 	switch baseID(c.ID) {
 	case "h264":
-		return h264Args(vendor)
+		return h264Args(vendor, speed)
 	case "hevc":
-		return hevcArgs(vendor)
+		return hevcArgs(vendor, speed)
 	case "av1":
-		return av1Args(vendor)
+		return av1Args(vendor, speed)
 	case "prores":
 		return []string{"-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"}
 	case "dnxhr":
@@ -176,60 +270,60 @@ func encoderArgs(c Codec, vendor hwstat.Vendor) []string {
 	case "mjpeg":
 		return []string{"-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj422p"}
 	default: // h264_sw and anything unknown
-		return swArgs("h264")
+		return swArgs("h264", speed)
 	}
 }
 
-func h264Args(vendor hwstat.Vendor) []string {
+func h264Args(vendor hwstat.Vendor, speed string) []string {
 	switch vendor {
 	case hwstat.VendorNVENC:
 		if hasEncoder("h264_nvenc") {
-			return []string{"-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"}
+			return []string{"-c:v", "h264_nvenc", "-preset", nvencPreset(speed), "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"}
 		}
 	case hwstat.VendorIntel:
 		if hasEncoder("h264_qsv") {
-			return []string{"-c:v", "h264_qsv", "-global_quality", "21", "-pix_fmt", "nv12"}
+			return []string{"-c:v", "h264_qsv", "-preset", qsvPreset(speed), "-global_quality", "21", "-pix_fmt", "nv12"}
 		}
 	case hwstat.VendorAMD:
 		if hasEncoder("h264_amf") {
-			return []string{"-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "21", "-qp_p", "23", "-pix_fmt", "yuv420p"}
+			return []string{"-c:v", "h264_amf", "-quality", amfQuality(speed), "-rc", "cqp", "-qp_i", "21", "-qp_p", "23", "-pix_fmt", "yuv420p"}
 		}
 	}
-	return swArgs("h264")
+	return swArgs("h264", speed)
 }
 
-func hevcArgs(vendor hwstat.Vendor) []string {
+func hevcArgs(vendor hwstat.Vendor, speed string) []string {
 	switch vendor {
 	case hwstat.VendorNVENC:
 		if hasEncoder("hevc_nvenc") {
-			return []string{"-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+			return []string{"-c:v", "hevc_nvenc", "-preset", nvencPreset(speed), "-rc", "vbr", "-cq", "23", "-b:v", "0", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
 		}
 	case hwstat.VendorIntel:
 		if hasEncoder("hevc_qsv") {
-			return []string{"-c:v", "hevc_qsv", "-global_quality", "23", "-pix_fmt", "nv12", "-tag:v", "hvc1"}
+			return []string{"-c:v", "hevc_qsv", "-preset", qsvPreset(speed), "-global_quality", "23", "-pix_fmt", "nv12", "-tag:v", "hvc1"}
 		}
 	case hwstat.VendorAMD:
 		if hasEncoder("hevc_amf") {
-			return []string{"-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "23", "-qp_p", "25", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
+			return []string{"-c:v", "hevc_amf", "-quality", amfQuality(speed), "-rc", "cqp", "-qp_i", "23", "-qp_p", "25", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"}
 		}
 	}
-	return swArgs("hevc")
+	return swArgs("hevc", speed)
 }
 
-func av1Args(vendor hwstat.Vendor) []string {
+func av1Args(vendor hwstat.Vendor, speed string) []string {
 	switch vendor {
 	case hwstat.VendorNVENC:
 		if hasEncoder("av1_nvenc") {
-			return []string{"-c:v", "av1_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "27", "-b:v", "0", "-pix_fmt", "yuv420p"}
+			return []string{"-c:v", "av1_nvenc", "-preset", nvencPreset(speed), "-rc", "vbr", "-cq", "27", "-b:v", "0", "-pix_fmt", "yuv420p"}
 		}
 	case hwstat.VendorIntel:
 		if hasEncoder("av1_qsv") {
-			return []string{"-c:v", "av1_qsv", "-global_quality", "27", "-pix_fmt", "nv12"}
+			return []string{"-c:v", "av1_qsv", "-preset", qsvPreset(speed), "-global_quality", "27", "-pix_fmt", "nv12"}
 		}
 	case hwstat.VendorAMD:
 		if hasEncoder("av1_amf") {
-			return []string{"-c:v", "av1_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "27", "-qp_p", "29", "-pix_fmt", "yuv420p"}
+			return []string{"-c:v", "av1_amf", "-quality", amfQuality(speed), "-rc", "cqp", "-qp_i", "27", "-qp_p", "29", "-pix_fmt", "yuv420p"}
 		}
 	}
-	return swArgs("av1")
+	return swArgs("av1", speed)
 }

@@ -37,10 +37,12 @@ type Config struct {
 	AudioDevice   string `json:"audio_device"`
 	AudioLoopback bool   `json:"audio_loopback"`
 	Codec         string `json:"codec"`
-	FPS           int    `json:"fps"`
-	OutDir        string `json:"out_dir"`
-	MaxChannels   int    `json:"max_channels"`
-	AutoRecord    bool   `json:"auto_record"`
+	// EncoderSpeed is the quality/throughput tier ID (see recorder.Speeds).
+	EncoderSpeed string `json:"encoder_speed"`
+	FPS          int    `json:"fps"`
+	OutDir       string `json:"out_dir"`
+	MaxChannels  int    `json:"max_channels"`
+	AutoRecord   bool   `json:"auto_record"`
 	// SessionFolders puts each recording session into its own timestamped
 	// subfolder of OutDir so files that belong together stay together.
 	SessionFolders bool `json:"session_folders"`
@@ -49,7 +51,7 @@ type Config struct {
 	Timecode bool `json:"timecode"`
 	// ResolveProject writes .drp, .xml and .fcpxml project files next to
 	// the recordings for direct import into DaVinci Resolve.
-	ResolveProject bool     `json:"resolve_project"`
+	ResolveProject bool `json:"resolve_project"`
 	// FillWeight is the load fraction (0..1) an encoder is filled to before
 	// channels spill to the next one (default 0.80).
 	FillWeight float64 `json:"fill_weight"`
@@ -73,7 +75,7 @@ func configPath() string {
 
 // LoadConfig reads the saved configuration (with defaults).
 func LoadConfig() Config {
-	cfg := Config{Codec: "h264", FPS: 30, MaxChannels: 8,
+	cfg := Config{Codec: "h264", EncoderSpeed: "balanced", FPS: 30, MaxChannels: 8,
 		SessionFolders: true, Timecode: true, ResolveProject: true,
 		FillWeight: 0.80, CostBaseline: 18}
 	home, _ := os.UserHomeDir()
@@ -92,6 +94,9 @@ func LoadConfig() Config {
 	}
 	if cfg.CostBaseline <= 0 {
 		cfg.CostBaseline = 18
+	}
+	if cfg.EncoderSpeed == "" {
+		cfg.EncoderSpeed = "balanced"
 	}
 	return cfg
 }
@@ -113,18 +118,19 @@ type App struct {
 	ffmpegPath string
 	ffmpegErr  error
 
-	vu        *VUMeter
-	recordBtn *widget.Button
-	elapsed      *widget.Label
-	statusBar    *widget.Label
+	vu           *VUMeter
+	recordBtn    *widget.Button
+	elapsed      *widget.RichText // "● 0:08" with a red recording dot
+	statusBar    *pathStatus   // transient messages; click-to-copy saved path
 	hwUsage      *widget.Label // live per-vendor encode utilization footer
 	ffmpegStatus *pathStatus   // compact ffmpeg loaded/missing indicator
-	grid      *fyne.Container
-	scroll    *container.Scroll
-	emptyBox  fyne.CanvasObject
+	grid         *fyne.Container
+	scroll       *container.Scroll
+	emptyBox     fyne.CanvasObject
 
 	audioSel   *widget.Select
 	codecSel   *widget.Select
+	speedSel   *widget.Select
 	fpsSel     *widget.Select
 	maxChSel   *widget.Select
 	fillSel    *widget.Select
@@ -211,7 +217,7 @@ func Run(eng *engine.Engine, aud *audio.Engine, version string) {
 
 func (a *App) buildUI() {
 	// --- record / elapsed
-	a.elapsed = widget.NewLabel("")
+	a.elapsed = widget.NewRichText()
 	a.recordBtn = widget.NewButtonWithIcon("Record", theme.MediaRecordIcon(), a.toggleRecord)
 	a.recordBtn.Importance = widget.HighImportance
 
@@ -246,6 +252,24 @@ func (a *App) buildUI() {
 		a.cfg.save()
 	})
 	a.codecSel.SetSelected(codecSel)
+
+	speedOpts := make([]string, len(recorder.Speeds))
+	speedSel := recorder.Speeds[1].Label
+	for i, s := range recorder.Speeds {
+		speedOpts[i] = s.Label
+		if s.ID == a.cfg.EncoderSpeed {
+			speedSel = s.Label
+		}
+	}
+	a.speedSel = widget.NewSelect(speedOpts, func(s string) {
+		for _, sp := range recorder.Speeds {
+			if sp.Label == s {
+				a.cfg.EncoderSpeed = sp.ID
+			}
+		}
+		a.cfg.save()
+	})
+	a.speedSel.SetSelected(speedSel)
 
 	a.fpsSel = widget.NewSelect([]string{"24", "25", "30", "50", "60"}, func(s string) {
 		a.cfg.FPS, _ = strconv.Atoi(s)
@@ -292,7 +316,7 @@ func (a *App) buildUI() {
 		a.cfg.save()
 	})
 	a.tcChk.SetChecked(a.cfg.Timecode)
-	a.resolveChk = widget.NewCheck("Resolve project files (.drp/.xml/.fcpxml)", func(v bool) {
+	a.resolveChk = widget.NewCheck("Davinci resolve project (.drp/.xml/.fcpxml)", func(v bool) {
 		a.cfg.ResolveProject = v
 		a.cfg.save()
 	})
@@ -319,8 +343,9 @@ func (a *App) buildUI() {
 	a.hwUsage.SetText(a.hwUsageText())
 
 	// --- status bar (transient messages; empty at rest)
-	a.statusBar = widget.NewLabel("")
-	a.statusBar.Truncation = fyne.TextTruncateEllipsis
+	a.statusBar = newPathStatus(a.fapp.Clipboard())
+	a.statusBar.setAlign(fyne.TextAlignLeading)
+	a.statusBar.setTruncate(true)
 
 	// --- compact ffmpeg indicator (path on hover, click to copy)
 	a.ffmpegStatus = newPathStatus(a.fapp.Clipboard())
@@ -331,24 +356,40 @@ func (a *App) buildUI() {
 	}
 
 	// --- layout
-	row1 := container.NewHBox(
-		a.recordBtn, a.elapsed,
-		layout.NewSpacer(),
-		widget.NewLabel("Audio:"), a.audioSel,
+	audioWrap := container.NewGridWrap(
+		fyne.NewSize(300, a.audioSel.MinSize().Height),
+		a.audioSel,
 	)
+	// Master VU meter, sized so its width matches the on-screen height of the
+	// per-channel video-input meters (they stretch to the 156px preview image
+	// height, see newCard), centered in the row.
+	vuWrap := container.NewCenter(container.NewGridWrap(
+		fyne.NewSize(156, a.vu.MinSize().Height),
+		a.vu,
+	))
 	addNDIBtn := widget.NewButtonWithIcon("Add NDI", theme.ContentAddIcon(), a.addNDISource)
-	row2 := container.NewHBox(
-		widget.NewLabel("Codec:"), a.codecSel,
-		widget.NewLabel("FPS:"), a.fpsSel,
-		widget.NewLabel("Max channels:"), a.maxChSel,
-		a.autoChk,
+	row1 := container.NewHBox(
+		a.recordBtn, addNDIBtn,
 		layout.NewSpacer(),
-		addNDIBtn,
+		a.elapsed,
+		vuWrap,
+		widget.NewLabel("Audio:"), audioWrap,
+	)
+	// Wide codec dropdown (its labels are long) with narrow FPS/channels so the
+	// row reads at a glance.
+	sized := func(w float32, o fyne.CanvasObject) fyne.CanvasObject {
+		return container.NewGridWrap(fyne.NewSize(w, o.MinSize().Height), o)
+	}
+	row2 := container.NewHBox(
+		widget.NewLabel("Codec:"), sized(280, a.codecSel),
+		widget.NewLabel("FPS:"), sized(70, a.fpsSel),
+		widget.NewLabel("Max channels:"), sized(70, a.maxChSel),
+		widget.NewLabel("Encoder:"), a.speedSel,
+		widget.NewLabel("Fill to:"), sized(70, a.fillSel),
+		layout.NewSpacer(),
 	)
 	row3 := container.NewBorder(nil, nil, widget.NewLabel("Save to:"), a.browseBtn, a.outEntry)
-	row4 := container.NewHBox(a.sessionChk, a.tcChk, a.resolveChk, layout.NewSpacer(),
-		widget.NewLabel("Fill encoder to:"), a.fillSel,
-	)
+	row4 := container.NewHBox(a.sessionChk, a.tcChk, a.resolveChk, a.autoChk, layout.NewSpacer())
 
 	a.grid = container.NewGridWrap(fyne.NewSize(324, 300))
 	a.scroll = container.NewVScroll(a.grid)
@@ -357,7 +398,7 @@ func (a *App) buildUI() {
 	a.emptyBox = container.NewCenter(emptyLbl)
 	a.rebuildGrid()
 
-	top := container.NewVBox(row1, row2, row3, row4, a.vu)
+	top := container.NewVBox(row1, row2, row3, row4)
 	body := container.NewStack(a.scroll, a.emptyBox)
 	verText := a.version
 	if verText != "" && verText[0] >= '0' && verText[0] <= '9' {
@@ -707,10 +748,20 @@ func (a *App) startTickers() {
 				a.hwUsage.SetText(a.hwUsageText())
 				if recording {
 					d := time.Since(a.recStart).Round(time.Second)
-					a.elapsed.SetText(fmt.Sprintf("● %s", d))
+					a.elapsed.Segments = []widget.RichTextSegment{
+						&widget.TextSegment{
+							Text:  "● ",
+							Style: widget.RichTextStyle{Inline: true, ColorName: theme.ColorNameError},
+						},
+						&widget.TextSegment{
+							Text:  d.String(),
+							Style: widget.RichTextStyle{Inline: true},
+						},
+					}
 				} else {
-					a.elapsed.SetText("")
+					a.elapsed.Segments = nil
 				}
+				a.elapsed.Refresh()
 			})
 		}
 	}()
@@ -768,7 +819,7 @@ func (a *App) cardStatus(card *channelCard) string {
 }
 
 func (a *App) setControlsEnabled(enabled bool) {
-	ws := []fyne.Disableable{a.audioSel, a.codecSel, a.fpsSel, a.maxChSel, a.fillSel,
+	ws := []fyne.Disableable{a.audioSel, a.codecSel, a.speedSel, a.fpsSel, a.maxChSel, a.fillSel,
 		a.outEntry, a.browseBtn, a.sessionChk, a.tcChk, a.resolveChk}
 	for _, w := range ws {
 		if enabled {
@@ -800,6 +851,7 @@ func (a *App) toggleRecord() {
 			a.eng.StopRecording()
 			fyne.Do(func() {
 				a.stopping = false
+				a.recordBtn.Importance = widget.HighImportance
 				a.recordBtn.SetText("Record")
 				a.recordBtn.SetIcon(theme.MediaRecordIcon())
 				a.recordBtn.Enable()
@@ -808,7 +860,7 @@ func (a *App) toggleRecord() {
 				if dir == "" {
 					dir = a.cfg.OutDir
 				}
-				a.statusBar.SetText("Recording saved to " + dir)
+				a.statusBar.set("✓ Recording saved", dir)
 			})
 		}()
 		return
@@ -832,6 +884,7 @@ func (a *App) toggleRecord() {
 		OutDir:         a.cfg.OutDir,
 		FPS:            a.cfg.FPS,
 		Codec:          recorder.CodecByID(a.cfg.Codec),
+		Speed:          a.cfg.EncoderSpeed,
 		Audio:          audioEng,
 		Timecode:       a.cfg.Timecode,
 		SessionFolders: a.cfg.SessionFolders,
@@ -843,12 +896,13 @@ func (a *App) toggleRecord() {
 		return
 	}
 	a.recStart = time.Now()
+	a.recordBtn.Importance = widget.DangerImportance
 	a.recordBtn.SetText("Stop")
 	a.recordBtn.SetIcon(theme.MediaStopIcon())
 	a.setControlsEnabled(false)
 	if n == 0 {
-		a.statusBar.SetText("Recording armed — waiting for senders (auto-record)…")
+		a.statusBar.set("Recording armed — waiting for senders (auto-record)…", "")
 	} else {
-		a.statusBar.SetText(fmt.Sprintf("Recording %d channel(s)…", n))
+		a.statusBar.set(fmt.Sprintf("Recording %d channel(s)…", n), "")
 	}
 }

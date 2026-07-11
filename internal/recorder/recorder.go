@@ -30,6 +30,7 @@ type Settings struct {
 	OutDir     string
 	FPS        int
 	Codec      Codec
+	Speed      string        // quality/throughput tier ID (see Speeds)
 	Audio      *audio.Engine // master audio device (used per channel-preference)
 
 	// Timecode embeds the wall-clock time-of-day as the file's start
@@ -62,9 +63,9 @@ type Recorder struct {
 	w, h        int
 	pixFmt      string
 	file        string
-	startTime   time.Time // wall-clock instant frame 0 corresponds to
-	startFrames int64     // start timecode as frames since midnight
-	audioCh     int       // audio channels in the file (0 = no audio track)
+	startTime   time.Time     // wall-clock instant frame 0 corresponds to
+	startFrames int64         // start timecode as frames since midnight
+	audioCh     int           // audio channels in the file (0 = no audio track)
 	vendor      hwstat.Vendor // encoder backend chosen by the load balancer
 	cmd         *exec.Cmd
 	stopCh      chan struct{}
@@ -81,9 +82,9 @@ type Info struct {
 	Name        string // channel name as passed to Start
 	File        string // output file path
 	W, H, FPS   int
-	StartFrames int64 // start timecode as frames since midnight
-	Frames      int64 // video frames written
-	AudioCh     int   // audio channels in the file (0 = none)
+	StartFrames int64         // start timecode as frames since midnight
+	Frames      int64         // video frames written
+	AudioCh     int           // audio channels in the file (0 = none)
 	Vendor      hwstat.Vendor // encoder backend used (nvenc/amd/intel/cpu)
 }
 
@@ -178,7 +179,7 @@ func Start(name string, buf *frame.Buffer, set Settings, audioSrc AudioSource, v
 		)
 	}
 
-	args = append(args, videoArgs(set.Codec, vendor, withAudio, audioCh)...)
+	args = append(args, videoArgs(set.Codec, vendor, set.Speed, withAudio, audioCh)...)
 	if withAudio {
 		// No -shortest: when the encoder lags behind real time, frames are
 		// still queued at stop, and -shortest would cut the file at the

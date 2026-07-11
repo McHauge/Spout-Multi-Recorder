@@ -210,8 +210,8 @@ type Engine struct {
 	sessionName string // timestamp name of the current/last session
 	stop        chan struct{}
 
-	sampler    *hwstat.Sampler      // live per-vendor encode utilization
-	balanceCfg recorder.BalanceCfg  // how channels are spread across encoders
+	sampler    *hwstat.Sampler     // live per-vendor encode utilization
+	balanceCfg recorder.BalanceCfg // how channels are spread across encoders
 
 	// OnChange is called (from the discovery goroutine) whenever the channel
 	// list changes. The UI wraps this with fyne.Do.
@@ -270,54 +270,9 @@ func (e *Engine) samplerLoad() hwstat.Load {
 	return e.sampler.Load()
 }
 
-// estimatedActiveLoadLocked sums the estimated per-vendor encode cost of the
-// recorders currently running. Caller must hold e.mu.
-func (e *Engine) estimatedActiveLoadLocked() hwstat.Load {
-	est := map[hwstat.Vendor]float64{}
-	for _, c := range e.channels {
-		c.mu.Lock()
-		rec := c.rec
-		c.mu.Unlock()
-		if rec == nil {
-			continue
-		}
-		info := rec.Info()
-		est[info.Vendor] += e.balanceCfg.EstimatedCost(info.W, info.H, info.FPS)
-	}
-	return hwstat.Load{
-		NVENC: est[hwstat.VendorNVENC],
-		AMD:   est[hwstat.VendorAMD],
-		Intel: est[hwstat.VendorIntel],
-		CPU:   est[hwstat.VendorCPU],
-	}
-}
-
-// blendedLoadLocked blends real measured utilization with the estimated load of
-// active recorders (per vendor, whichever is higher), so the reading reflects a
-// just-started encoder immediately and tracks real load as it climbs. Caller
-// must hold e.mu.
-func (e *Engine) blendedLoadLocked() hwstat.Load {
-	real := e.samplerLoad()
-	est := e.estimatedActiveLoadLocked()
-	maxf := func(a, b float64) float64 {
-		if a > b {
-			return a
-		}
-		return b
-	}
-	return hwstat.Load{
-		NVENC: maxf(real.NVENC, est.NVENC),
-		AMD:   maxf(real.AMD, est.AMD),
-		Intel: maxf(real.Intel, est.Intel),
-		CPU:   maxf(real.CPU, est.CPU),
-	}
-}
-
-// HWLoad returns the blended per-vendor encode utilization for the UI footer.
+// HWLoad returns the real per-vendor encode utilization for the UI footer.
 func (e *Engine) HWLoad() hwstat.Load {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.blendedLoadLocked()
+	return e.samplerLoad()
 }
 
 // Close stops discovery, capture loops and any recording. The wait for the
@@ -440,10 +395,10 @@ func (e *Engine) discoveryLoop() {
 				if w == 0 || h == 0 {
 					continue
 				}
-				// Assign one channel against the current blended load so late
+				// Assign one channel against the current measured load so late
 				// joiners spill off already-busy encoders instead of piling on.
 				plan := []recorder.PlanInput{{Channel: c.Name, W: w, H: h, FPS: e.recSet.FPS}}
-				assign := recorder.Assign(plan, recorder.AvailableVendors(e.recSet.Codec), e.blendedLoadLocked(), e.balanceCfg)
+				assign := recorder.Assign(plan, recorder.AvailableVendors(e.recSet.Codec), e.samplerLoad(), e.balanceCfg)
 				rec, err := recorder.Start(c.Name, c.Buf, e.recSet, e.audioSourceFor(c, e.recSet), assign[c.Name])
 				if err != nil {
 					log.Printf("auto-record %s: %v", n, err)

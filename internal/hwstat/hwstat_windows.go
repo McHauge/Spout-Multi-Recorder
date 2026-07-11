@@ -3,18 +3,18 @@
 package hwstat
 
 import (
-	"os/exec"
+	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-// sampleState holds per-sampler OS handles and the previous CPU snapshot so
-// utilization can be derived from deltas between ticks.
+// sampleState holds per-sampler OS handles, the previous CPU snapshot (so CPU
+// load can be derived from deltas), and the GPU LUID→vendor map used to
+// attribute encode-engine counters to the right vendor.
 type sampleState struct {
 	// CPU delta tracking (100-ns FILETIME ticks).
 	prevIdle, prevKernel, prevUser uint64
@@ -25,13 +25,12 @@ type sampleState struct {
 	pdhCounter uintptr
 	pdhOK      bool
 
-	// nvidia-smi discovery (looked up lazily, cached).
-	nvOnce sync.Once
-	nvPath string
+	// Maps an adapter LUID key ("high_low", 8 hex each) to its encoder vendor.
+	luidVendor map[string]Vendor
 }
 
 func newSampleState() *sampleState {
-	s := &sampleState{}
+	s := &sampleState{luidVendor: buildLuidVendor()}
 	s.openPDH()
 	return s
 }
@@ -43,27 +42,22 @@ func (s *sampleState) close() {
 	}
 }
 
-// sample builds one utilization snapshot. NVENC comes from nvidia-smi; the
-// non-NVIDIA GPU video-encode load (Intel/AMD) is the total measured encode
-// utilization minus NVENC, reported on whichever of those vendors is present
-// (the UI hides absent ones). CPU is the system-wide busy percentage.
+// sample builds one utilization snapshot: real per-vendor video-encode
+// utilization from the Windows GPU Engine counters (attributed by adapter
+// LUID) plus system-wide CPU load. Numbers match Task Manager's per-engine
+// "Video Encode" / "Video Codec Engine" graphs.
 func sample(s *sampleState) Load {
 	cpu := s.cpuPct()
-	nv := s.nvEncoderPct()
-	gpuTotal := s.gpuEncodePct()
-	other := gpuTotal - nv
-	if other < 0 {
-		other = 0
-	}
+	enc := s.gpuEncodeByVendor()
 	return Load{
-		NVENC: clampPct(nv),
-		AMD:   clampPct(other),
-		Intel: clampPct(other),
+		NVENC: enc[VendorNVENC],
+		AMD:   enc[VendorAMD],
+		Intel: enc[VendorIntel],
 		CPU:   clampPct(cpu),
 	}
 }
 
-// --- GPU presence via DXGI adapter enumeration -----------------------------
+// --- GPU enumeration via DXGI ----------------------------------------------
 
 var (
 	moddxgi               = windows.NewLazySystemDLL("dxgi.dll")
@@ -76,7 +70,7 @@ var iidIDXGIFactory = windows.GUID{
 	Data4: [8]byte{0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69},
 }
 
-// dxgiAdapterDesc mirrors DXGI_ADAPTER_DESC; only VendorId is used.
+// dxgiAdapterDesc mirrors DXGI_ADAPTER_DESC; VendorId and AdapterLuid are used.
 type dxgiAdapterDesc struct {
 	Description           [128]uint16
 	VendorId              uint32
@@ -108,13 +102,23 @@ func comCall(this unsafe.Pointer, idx int, args ...uintptr) uintptr {
 	return ret
 }
 
-// detectGPUVendors enumerates the installed display adapters and reports which
-// encoder vendors are physically present. Returns nil if DXGI is unavailable so
-// callers fail open. IDXGIFactory::EnumAdapters is vtable slot 7,
+type adapterInfo struct {
+	vendor Vendor
+	luid   string // "high_low", 8 lowercase hex digits each
+}
+
+// luidKey formats a LUID the same way GPU Engine counter instances encode it.
+func luidKey(high uint32, low uint32) string {
+	return fmt.Sprintf("%08x_%08x", high, low)
+}
+
+// enumAdapters lists the encoder-capable display adapters (NVIDIA/AMD/Intel)
+// with their LUIDs. The second result is false when DXGI is unavailable, so
+// callers can fail open. IDXGIFactory::EnumAdapters is vtable slot 7,
 // IDXGIAdapter::GetDesc is slot 8, IUnknown::Release is slot 2.
-func detectGPUVendors() map[Vendor]bool {
+func enumAdapters() ([]adapterInfo, bool) {
 	if err := procCreateDXGIFactory.Find(); err != nil {
-		return nil
+		return nil, false
 	}
 	var factory unsafe.Pointer
 	r, _, _ := procCreateDXGIFactory.Call(
@@ -122,11 +126,11 @@ func detectGPUVendors() map[Vendor]bool {
 		uintptr(unsafe.Pointer(&factory)),
 	)
 	if r != 0 || factory == nil {
-		return nil
+		return nil, false
 	}
 	defer comCall(factory, 2) // Release factory
 
-	present := map[Vendor]bool{}
+	var out []adapterInfo
 	for i := 0; ; i++ {
 		var adapter unsafe.Pointer
 		if comCall(factory, 7, uintptr(uint32(i)), uintptr(unsafe.Pointer(&adapter))) != 0 || adapter == nil {
@@ -134,18 +138,52 @@ func detectGPUVendors() map[Vendor]bool {
 		}
 		var desc dxgiAdapterDesc
 		if comCall(adapter, 8, uintptr(unsafe.Pointer(&desc))) == 0 {
+			var v Vendor
 			switch desc.VendorId {
 			case vendorNVIDIA:
-				present[VendorNVENC] = true
+				v = VendorNVENC
 			case vendorAMD:
-				present[VendorAMD] = true
+				v = VendorAMD
 			case vendorIntel:
-				present[VendorIntel] = true
+				v = VendorIntel
+			}
+			if v != "" {
+				out = append(out, adapterInfo{
+					vendor: v,
+					luid:   luidKey(uint32(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart),
+				})
 			}
 		}
 		comCall(adapter, 2) // Release adapter
 	}
+	return out, true
+}
+
+// detectGPUVendors reports which encoder vendors are physically installed.
+// Returns nil if DXGI is unavailable so callers fail open.
+func detectGPUVendors() map[Vendor]bool {
+	adapters, ok := enumAdapters()
+	if !ok {
+		return nil
+	}
+	present := map[Vendor]bool{}
+	for _, a := range adapters {
+		present[a.vendor] = true
+	}
 	return present
+}
+
+// buildLuidVendor maps each adapter LUID to its vendor for counter attribution.
+func buildLuidVendor() map[string]Vendor {
+	adapters, ok := enumAdapters()
+	if !ok {
+		return nil
+	}
+	m := make(map[string]Vendor, len(adapters))
+	for _, a := range adapters {
+		m[a.luid] = a.vendor
+	}
+	return m
 }
 
 // --- CPU via GetSystemTimes ------------------------------------------------
@@ -184,39 +222,7 @@ func (s *sampleState) cpuPct() float64 {
 	return busy * 100
 }
 
-// --- NVENC via nvidia-smi --------------------------------------------------
-
-func (s *sampleState) nvEncoderPct() float64 {
-	s.nvOnce.Do(func() {
-		if p, err := exec.LookPath("nvidia-smi"); err == nil {
-			s.nvPath = p
-		}
-	})
-	if s.nvPath == "" {
-		return 0
-	}
-	cmd := exec.Command(s.nvPath,
-		"--query-gpu=utilization.encoder", "--format=csv,noheader,nounits")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	out, err := cmd.Output()
-	if err != nil {
-		return 0
-	}
-	// One line per GPU; take the busiest encoder.
-	var maxPct float64
-	for _, line := range strings.Split(string(out), "\n") {
-		f := strings.TrimSpace(line)
-		if f == "" {
-			continue
-		}
-		if v, err := strconv.ParseFloat(f, 64); err == nil && v > maxPct {
-			maxPct = v
-		}
-	}
-	return maxPct
-}
-
-// --- Total GPU video-encode via PDH ---------------------------------------
+// --- Per-vendor GPU video-encode via PDH -----------------------------------
 
 var (
 	modpdh                        = windows.NewLazySystemDLL("pdh.dll")
@@ -230,9 +236,20 @@ var (
 const (
 	pdhFmtDouble = 0x00000200
 	pdhMoreData  = 0x800007D2
-	// Sum utilization across every GPU video-encode engine instance.
-	gpuEncodeCounterPath = `\GPU Engine(*engtype_VideoEncode)\Utilization Percentage`
+	// All GPU engine instances; we filter to the encode-capable engines in
+	// code. Vendors name them differently — NVIDIA/Intel expose "VideoEncode",
+	// AMD a unified "VideoCodec" engine — so a fixed engtype wildcard misses
+	// some hardware.
+	gpuEncodeCounterPath = `\GPU Engine(*)\Utilization Percentage`
 )
+
+// isEncodeEngine reports whether a GPU engine type does video encoding. Matches
+// NVIDIA/Intel "VideoEncode" and AMD's combined "VideoCodec" engine; excludes
+// decode, 3D, copy, etc.
+func isEncodeEngine(engtype string) bool {
+	e := strings.ToLower(engtype)
+	return strings.Contains(e, "encode") || strings.Contains(e, "codec")
+}
 
 // pdhFmtCounterValue mirrors PDH_FMT_COUNTERVALUE (union sized to 8 bytes).
 type pdhFmtCounterValue struct {
@@ -271,12 +288,52 @@ func (s *sampleState) openPDH() {
 	s.pdhQuery, s.pdhCounter, s.pdhOK = query, counter, true
 }
 
-func (s *sampleState) gpuEncodePct() float64 {
+// parseGPUInstance extracts the adapter LUID key, engine index and engine type
+// from a GPU Engine counter instance name, e.g.
+// "pid_9552_luid_0x00000000_0x0000C4E7_phys_0_eng_3_engtype_VideoEncode".
+func parseGPUInstance(name string) (luid, eng, engtype string, ok bool) {
+	parts := strings.Split(name, "_")
+	var high, low string
+	for i := 0; i < len(parts); i++ {
+		switch parts[i] {
+		case "luid":
+			if i+2 < len(parts) {
+				high, low = parts[i+1], parts[i+2]
+			}
+		case "eng":
+			if i+1 < len(parts) {
+				eng = parts[i+1]
+			}
+		case "engtype":
+			if i+1 < len(parts) {
+				engtype = strings.Join(parts[i+1:], "_")
+			}
+		}
+	}
+	if high == "" || low == "" {
+		return "", "", "", false
+	}
+	return luidKey(hex32(high), hex32(low)), eng, engtype, true
+}
+
+func hex32(s string) uint32 {
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	v, _ := strconv.ParseUint(s, 16, 64)
+	return uint32(v)
+}
+
+// gpuEncodeByVendor returns the current video-encode utilization per vendor.
+// Instances are attributed to a vendor by adapter LUID, summed per engine node
+// (matching what one Task Manager engine graph shows), and the busiest node is
+// reported per vendor — summing across nodes would overcount.
+func (s *sampleState) gpuEncodeByVendor() map[Vendor]float64 {
+	out := map[Vendor]float64{}
 	if !s.pdhOK {
-		return 0
+		return out
 	}
 	if r, _, _ := procPdhCollectQueryData.Call(s.pdhQuery); r != 0 {
-		return 0
+		return out
 	}
 	// First call sizes the buffer (expects PDH_MORE_DATA).
 	var bufSize, itemCount uint32
@@ -285,24 +342,47 @@ func (s *sampleState) gpuEncodePct() float64 {
 		uintptr(unsafe.Pointer(&bufSize)), uintptr(unsafe.Pointer(&itemCount)), 0,
 	)
 	if r != pdhMoreData || bufSize == 0 || itemCount == 0 {
-		return 0
+		return out
 	}
 	buf := make([]byte, bufSize)
-	r, _, _ = procPdhGetFormattedCntrArrayW.Call(
+	if r, _, _ = procPdhGetFormattedCntrArrayW.Call(
 		s.pdhCounter, pdhFmtDouble,
 		uintptr(unsafe.Pointer(&bufSize)), uintptr(unsafe.Pointer(&itemCount)),
 		uintptr(unsafe.Pointer(&buf[0])),
-	)
-	if r != 0 {
-		return 0
+	); r != 0 {
+		return out
 	}
 	items := unsafe.Slice((*pdhFmtCounterValueItemW)(unsafe.Pointer(&buf[0])), itemCount)
-	var total float64
+
+	// Sum process utilization per (vendor, engine node), keeping only the
+	// encode-capable engines.
+	nodes := map[Vendor]map[string]float64{}
 	for i := range items {
-		// CStatus 0 (VALID_DATA) or 1 (NEW_DATA) are usable.
-		if items[i].FmtValue.CStatus <= 1 {
-			total += items[i].FmtValue.DoubleValue
+		if items[i].FmtValue.CStatus > 1 { // keep VALID_DATA / NEW_DATA only
+			continue
 		}
+		luid, eng, engtype, ok := parseGPUInstance(windows.UTF16PtrToString(items[i].SzName))
+		if !ok || !isEncodeEngine(engtype) {
+			continue
+		}
+		v, found := s.luidVendor[luid]
+		if !found {
+			continue
+		}
+		if nodes[v] == nil {
+			nodes[v] = map[string]float64{}
+		}
+		nodes[v][engtype+"#"+eng] += items[i].FmtValue.DoubleValue
 	}
-	return total
+	// Report the busiest engine node per vendor.
+	for v, byEng := range nodes {
+		var maxNode float64
+		for _, val := range byEng {
+			if val > maxNode {
+				maxNode = val
+			}
+		}
+		out[v] = clampPct(maxNode)
+	}
+	return out
 }
