@@ -22,6 +22,7 @@ Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutD
 - **NDI** — full-bandwidth NDI *and* NDI|HX: added manually via the **Add NDI** button, which lists the sources discovered on the network. Added sources are remembered across restarts and removable via the 🗑 button on the card. Receivers connect by source name, so they survive the sending application restarting (reconnects automatically, including on a new address). Requires the [NDI runtime](https://ndi.video/tools/) on the machine; HX decoding is handled by the runtime.
 - **Webcam (UVC)** — added via **Add Webcam**, which lists the connected cameras (via Media Foundation). **Resolution** defaults to *Auto* — the highest resolution the camera can sustain at the recording frame rate (so a 1080p30/720p60 camera set to 60 fps records 720p rather than a stuttering 1080p) — or pick an explicit mode from the dropdown. MJPEG/YUY2/NV12 are decoded and converted to BGRA. The dialog also offers any **audio endpoint** (🎤 input or 🔊 speaker loopback, same as master audio) as this channel's native audio, preselecting the mic whose name matches the camera. Survives USB unplug/replug (reconnects automatically).
 - **DeckLink** — Blackmagic SDI/HDMI capture cards, added via **Add DeckLink**. Uses the driver's **automatic input-format detection**, so the resolution/frame rate follow the incoming signal (and re-lock if it changes). Embedded SDI audio is captured up to 16 channels. Requires the [Blackmagic Desktop Video](https://www.blackmagicdesign.com/support/family/capture-and-playback) driver; without it the button reports that the driver was not found.
+- **Web streams** — RTMP, RTSP (plus `rtspt://` to force TCP transport), HLS (`http(s)://…m3u8`), SRT, UDP and anything else your FFmpeg build can pull, added via **Add Stream** (URL + optional name). The stream is decoded through FFmpeg into the normal pipeline, so it gets a preview card, VU meters, black-frame dropout handling and timecode like every other source, and reconnects automatically with backoff if the stream drops or stalls. Embedded stream audio is recorded by default (up to 16 channels). Note: protocol support depends on the FFmpeg build (e.g. SRT needs a build with libsrt — the gyan.dev "full" build has it), and web streams carry their protocol's inherent latency, so their timecode marks *arrival* on this machine, not the sender's clock.
 
 ### Audio
 
@@ -51,7 +52,7 @@ Written in Go, with the [Spout2 SDK](https://github.com/leadedge/Spout2) (SpoutD
 
 ## Using it
 
-1. Start the app. Running Spout senders appear automatically; add other sources with **Add NDI**, **Add Webcam** or **Add DeckLink**.
+1. Start the app. Running Spout senders appear automatically; add other sources with **Add NDI**, **Add Webcam**, **Add DeckLink** or **Add Stream** (RTMP/RTSP/HLS/SRT URL).
 2. Pick the **Audio** master source (🔊 = speaker loopback, 🎤 = input) — the VU meter confirms signal — and set the per-card **master audio** checkboxes as needed.
 3. Pick **Codec**, **FPS**, **Max channels** and the output folder.
 4. Tick **record** on the channels you want, press **Record**, later **Stop**. Every armed channel becomes its own file.

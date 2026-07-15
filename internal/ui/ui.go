@@ -34,6 +34,7 @@ import (
 	"github.com/McHauge/Spout-Multi-Recorder/internal/mfcap"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/ndi"
 	"github.com/McHauge/Spout-Multi-Recorder/internal/recorder"
+	"github.com/McHauge/Spout-Multi-Recorder/internal/webstream"
 )
 
 // Config is persisted between runs.
@@ -77,6 +78,19 @@ type Config struct {
 	DeckLinkSources []string `json:"decklink_sources,omitempty"`
 	// Per-DeckLink master-audio preference (default false = native SDI audio).
 	DLReplaceAudio map[string]bool `json:"dl_replace_audio,omitempty"`
+
+	// StreamSources are manually added network streams (RTMP, RTSP/rtspt,
+	// HLS, SRT, ...) pulled and recorded through FFmpeg.
+	StreamSources []StreamSource `json:"stream_sources,omitempty"`
+	// StreamReplaceAudio maps stream name -> master-audio preference
+	// (default false = the stream's own embedded audio).
+	StreamReplaceAudio map[string]bool `json:"stream_replace_audio,omitempty"`
+}
+
+// StreamSource is a persisted network stream: a display name and its URL.
+type StreamSource struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
 }
 
 // WebcamSource is a persisted webcam: the stable device symbolic link (used to
@@ -225,6 +239,9 @@ func Run(eng *engine.Engine, aud *audio.Engine, version string) {
 	}
 	for _, n := range a.cfg.DeckLinkSources {
 		eng.AddDeckLink(n, a.cfg.DLReplaceAudio[n])
+	}
+	for _, s := range a.cfg.StreamSources {
+		eng.AddWeb(s.Name, s.URL, a.cfg.StreamReplaceAudio[s.Name])
 	}
 	a.ffmpegPath, a.ffmpegErr = recorder.FindFFmpeg()
 	if a.ffmpegErr == nil {
@@ -418,8 +435,9 @@ func (a *App) buildUI() {
 	addNDIBtn := widget.NewButtonWithIcon("Add NDI", theme.ContentAddIcon(), a.addNDISource)
 	addCamBtn := widget.NewButtonWithIcon("Add Webcam", theme.ContentAddIcon(), a.addWebcamSource)
 	addDLBtn := widget.NewButtonWithIcon("Add DeckLink", theme.ContentAddIcon(), a.addDeckLinkSource)
+	addStreamBtn := widget.NewButtonWithIcon("Add Stream", theme.ContentAddIcon(), a.addStreamSource)
 	row1 := container.NewHBox(
-		a.recordBtn, addNDIBtn, addCamBtn, addDLBtn,
+		a.recordBtn, addNDIBtn, addCamBtn, addDLBtn, addStreamBtn,
 		layout.NewSpacer(),
 		a.elapsed,
 		vuWrap,
@@ -443,7 +461,7 @@ func (a *App) buildUI() {
 
 	a.grid = container.NewGridWrap(fyne.NewSize(324, 300))
 	a.scroll = container.NewVScroll(a.grid)
-	emptyLbl := widget.NewLabel("Waiting for Spout senders…\nStart any Spout-enabled app and it will appear here,\nor use Add NDI / Add Webcam / Add DeckLink above.")
+	emptyLbl := widget.NewLabel("Waiting for Spout senders…\nStart any Spout-enabled app and it will appear here,\nor use Add NDI / Add Webcam / Add DeckLink / Add Stream above.")
 	emptyLbl.Alignment = fyne.TextAlignCenter
 	a.emptyBox = container.NewCenter(emptyLbl)
 	a.rebuildGrid()
@@ -561,6 +579,8 @@ func (a *App) newCard(ch *engine.Channel) *channelCard {
 		title = "Cam • " + title
 	case engine.KindDeckLink:
 		title = "DeckLink • " + title
+	case engine.KindWeb:
+		title = "Stream • " + title
 	}
 	name := widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	name.Truncation = fyne.TextTruncateEllipsis
@@ -950,6 +970,15 @@ func (a *App) removeManualSource(ch *engine.Channel) {
 	case engine.KindDeckLink:
 		a.cfg.DeckLinkSources = removeString(a.cfg.DeckLinkSources, name)
 		delete(a.cfg.DLReplaceAudio, name)
+	case engine.KindWeb:
+		out := a.cfg.StreamSources[:0]
+		for _, s := range a.cfg.StreamSources {
+			if s.Name != name {
+				out = append(out, s)
+			}
+		}
+		a.cfg.StreamSources = out
+		delete(a.cfg.StreamReplaceAudio, name)
 	}
 	a.cfg.save()
 }
@@ -985,6 +1014,11 @@ func (a *App) saveReplaceAudioPref(ch *engine.Channel, v bool) {
 			a.cfg.DLReplaceAudio = map[string]bool{}
 		}
 		a.cfg.DLReplaceAudio[name] = v
+	case engine.KindWeb:
+		if a.cfg.StreamReplaceAudio == nil {
+			a.cfg.StreamReplaceAudio = map[string]bool{}
+		}
+		a.cfg.StreamReplaceAudio[name] = v
 	default:
 		return // Spout: nothing to persist
 	}
@@ -1252,4 +1286,45 @@ func (a *App) toggleRecord() {
 	} else {
 		a.statusBar.set(fmt.Sprintf("Recording %d channel(s)…", n), "")
 	}
+}
+
+// addStreamSource asks for a stream URL (plus an optional display name) and
+// adds it as a channel. Anything the local FFmpeg build can pull works:
+// rtmp://, rtsp:// (rtspt:// forces TCP transport), HLS http(s)://…m3u8,
+// srt://, udp://, … The stream's own audio is recorded by default when it
+// has any (uncheck "master audio" behaviour per card as usual).
+func (a *App) addStreamSource() {
+	urlEntry := widget.NewEntry()
+	urlEntry.SetPlaceHolder("rtmp:// · rtsp:// · rtspt:// · srt:// · https://…m3u8")
+	nameEntry := widget.NewEntry()
+	nameEntry.SetPlaceHolder("optional — derived from the URL")
+	items := []*widget.FormItem{
+		widget.NewFormItem("URL", urlEntry),
+		widget.NewFormItem("Name", nameEntry),
+	}
+	d := dialog.NewForm("Add web stream", "Add", "Cancel", items, func(ok bool) {
+		if !ok {
+			return
+		}
+		u := strings.TrimSpace(urlEntry.Text)
+		if !webstream.ValidURL(u) {
+			dialog.ShowError(fmt.Errorf("that does not look like a stream URL (need scheme://…)"), a.win)
+			return
+		}
+		name := strings.TrimSpace(nameEntry.Text)
+		if name == "" {
+			name = webstream.DeriveName(u)
+		}
+		for _, s := range a.cfg.StreamSources {
+			if s.Name == name {
+				dialog.ShowError(fmt.Errorf("a stream named %q already exists", name), a.win)
+				return
+			}
+		}
+		a.eng.AddWeb(name, u, a.cfg.StreamReplaceAudio[name])
+		a.cfg.StreamSources = append(a.cfg.StreamSources, StreamSource{Name: name, URL: u})
+		a.cfg.save()
+	}, a.win)
+	d.Resize(fyne.NewSize(560, 0))
+	d.Show()
 }

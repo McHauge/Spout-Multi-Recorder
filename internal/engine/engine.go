@@ -29,9 +29,10 @@ const (
 	NDIPrefix      = "ndi:"
 	WebcamPrefix   = "cam:"
 	DeckLinkPrefix = "dl:"
+	WebPrefix      = "web:"
 )
 
-var allPrefixes = []string{NDIPrefix, WebcamPrefix, DeckLinkPrefix}
+var allPrefixes = []string{NDIPrefix, WebcamPrefix, DeckLinkPrefix, WebPrefix}
 
 // stripPrefix removes any known source-kind prefix from a channel name.
 func stripPrefix(name string) string {
@@ -51,6 +52,7 @@ const (
 	KindNDI                        // manually added NDI source
 	KindWebcam                     // manually added UVC/Media Foundation webcam
 	KindDeckLink                   // manually added Blackmagic DeckLink input
+	KindWeb                        // manually added network stream (RTMP/RTSP/HLS/SRT/...)
 )
 
 // String returns a human label used in logs.
@@ -62,6 +64,8 @@ func (k SourceKind) String() string {
 		return "webcam"
 	case KindDeckLink:
 		return "DeckLink"
+	case KindWeb:
+		return "stream"
 	default:
 		return "Spout"
 	}
@@ -74,7 +78,7 @@ type Channel struct {
 	Buf  *frame.Buffer
 
 	eng           *Engine    // back-reference for manual sources (nil for Spout)
-	deviceID      string     // webcam symbolic link / DeckLink device name (reopen key)
+	deviceID      string     // webcam symbolic link / DeckLink device name / stream URL (reopen key)
 	audioDev      string     // webcam mic WASAPI endpoint name ("" = none)
 	audioLoopback bool       // webcam mic endpoint is a playback loopback source
 	camMode       mfcap.Mode // webcam desired mode (zero = auto)
